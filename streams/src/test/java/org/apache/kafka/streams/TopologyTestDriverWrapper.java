@@ -20,6 +20,7 @@ import org.apache.kafka.streams.errors.StreamsException;
 import org.apache.kafka.streams.processor.api.ProcessorContext;
 import org.apache.kafka.streams.processor.internals.ProcessorContextImpl;
 import org.apache.kafka.streams.processor.internals.ProcessorNode;
+import org.apache.kafka.streams.processor.internals.StreamTask;
 
 import java.util.Properties;
 
@@ -43,10 +44,10 @@ public class TopologyTestDriverWrapper extends TopologyTestDriver {
      * @return the processor context
      */
     @SuppressWarnings("unchecked")
-    public <K, V> ProcessorContext<K, V> setCurrentNodeForProcessorContext(final String processorName) {
-        final ProcessorContext<K, V> context = task.processorContext();
-        ((ProcessorContextImpl) context).setCurrentNode(getProcessor(processorName));
-        return context;
+    public <K, V> ProcessorContext<K, V> setCurrentNodeForProcessorContext(final String processorName, final StreamTask task) {
+            final ProcessorContext<K, V> context = task.processorContext();
+            ((ProcessorContextImpl) context).setCurrentNode(getProcessor(processorName));
+            return context;
     }
 
     /**
@@ -56,7 +57,7 @@ public class TopologyTestDriverWrapper extends TopologyTestDriver {
      * @return the processor matching the search name
      */
     public ProcessorNode<?, ?, ?, ?> getProcessor(final String name) {
-        for (final ProcessorNode<?, ?, ?, ?> node : processorTopology.processors()) {
+        for (final ProcessorNode<?, ?, ?, ?> node : topProcessorTopology.processors()) {
             if (node.name().equals(name)) {
                 return node;
             }
