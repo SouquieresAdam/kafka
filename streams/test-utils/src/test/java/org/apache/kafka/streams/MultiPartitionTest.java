@@ -251,4 +251,62 @@ public class MultiPartitionTest {
         //No more output in topic
         assertThat(outputTopic.isEmpty(), is(true));
     }
+
+    @Test
+    public void testMultiPartitionWrongRepartition() {
+        final StreamsBuilder builder = new StreamsBuilder();
+        //Create Actual Stream Processing pipeline
+
+        // Create String/String KeyValue statestore
+        builder.addStateStore(
+                Stores.keyValueStoreBuilder(
+                        Stores.persistentKeyValueStore("store"),
+                        stringSerde,
+                        longSerde));
+
+        final var stream1 = builder.stream(INPUT_TOPIC, Consumed.with(stringSerde, stringSerde))
+                .selectKey((k, v) -> k) // keep the key as partition driver, should not aggregate properly
+                .repartition(Repartitioned.with(stringSerde, stringSerde));
+        final var stream2 = builder.stream(INPUT2_TOPIC, Consumed.with(stringSerde, stringSerde))
+                .selectKey((k, v) -> k) // keep the key as partition driver, should not aggregate properly
+                .repartition(Repartitioned.with(stringSerde, stringSerde));
+
+        stream1.process(ValueProcessor::new, "store").to(OUTPUT_TOPIC, Produced.with(stringSerde, longSerde));
+        stream2.process(ValueProcessor::new, "store").to(OUTPUT_TOPIC, Produced.with(stringSerde, longSerde));
+
+        final Properties properties = new Properties();
+        properties.put(StreamsConfig.DEFAULT_KEY_SERDE_CLASS_CONFIG, Serdes.ByteArraySerde.class);
+        properties.put(StreamsConfig.DEFAULT_VALUE_SERDE_CLASS_CONFIG, Serdes.ByteArraySerde.class);
+
+        testDriver = new TopologyTestDriver(builder.build(), properties, testBaseTime, 3);
+
+        final TestInputTopic<String, String> inputTopic =
+                testDriver.createInputTopic(INPUT_TOPIC, stringSerde.serializer(), stringSerde.serializer());
+        final TestInputTopic<String, String> inputTopic2 =
+                testDriver.createInputTopic(INPUT2_TOPIC, stringSerde.serializer(), stringSerde.serializer());
+
+        final TestOutputTopic<String, Long> outputTopic =
+                testDriver.createOutputTopic(OUTPUT_TOPIC, stringSerde.deserializer(), longSerde.deserializer());
+
+        inputTopic.pipeInput("k1", "Hello");
+        inputTopic2.pipeInput("k1", "World");
+
+        final var result = outputTopic.readKeyValuesToList();
+        assertThat(result.get(0).key, equalTo("Hello"));
+        assertThat(result.get(1).key, equalTo("World"));
+        assertThat(result.get(0).value, equalTo(1L));
+        assertThat(result.get(1).value, equalTo(1L));
+
+        inputTopic.pipeInput("k1", "Hello");
+        inputTopic2.pipeInput("k2", "World");
+
+        final var result2 = outputTopic.readKeyValuesToList();
+        assertThat(result2.get(0).key, equalTo("Hello"));
+        assertThat(result2.get(1).key, equalTo("World"));
+        assertThat(result2.get(0).value, equalTo(2L));
+        assertThat(result2.get(1).value, equalTo(1L));
+
+        //No more output in topic
+        assertThat(outputTopic.isEmpty(), is(true));
+    }
 }
