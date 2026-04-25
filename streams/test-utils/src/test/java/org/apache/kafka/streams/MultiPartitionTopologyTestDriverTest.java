@@ -421,4 +421,196 @@ public class MultiPartitionTopologyTestDriverTest {
             ctx.forward(record.withValue(next));
         }
     }
+
+    /**
+     * Two sources with different partition counts ({@code inA}=4, {@code inB}=2) merged into one
+     * sub-topology that increments a shared {@code counts} store. The {@code inB} side is aligned
+     * to 4 partitions via {@link Repartitioned#withNumberOfPartitions(int)} so the merge
+     * co-partitions. The same key arriving on both sides must land in the same store partition
+     * (because {@link StringSerializer} ignores the topic name, so {@code murmur2 % 4} matches
+     * across {@code inA} and the repartition topic).
+     */
+    @Test
+    public void coAlignedKeysAggregateAcrossSourcesAfterRepartition() {
+        final String inA = "inA";  // 4 partitions
+        final String inB = "inB";  // 2 partitions, repartitioned up to 4 below
+
+        final StreamsBuilder builder = new StreamsBuilder();
+        builder.addStateStore(Stores.keyValueStoreBuilder(
+            Stores.inMemoryKeyValueStore("counts"),
+            Serdes.String(),
+            Serdes.Long()));
+
+        final KStream<String, String> streamA =
+            builder.stream(inA, Consumed.with(Serdes.String(), Serdes.String()));
+        final KStream<String, String> streamB =
+            builder.stream(inB, Consumed.with(Serdes.String(), Serdes.String()));
+
+        final KStream<String, String> alignedB = streamB
+            .repartition(Repartitioned.<String, String>with(Serdes.String(), Serdes.String())
+                .withNumberOfPartitions(4));
+
+        streamA.merge(alignedB).process(CountIncrementer::new, "counts");
+
+        // With two source partitions feeding one merged sub-topology, the default
+        // max.task.idle.ms=0 would let a task stall waiting for the side that has not been
+        // pipeInput'd yet. -1 disables idling so each pipeInput drains immediately.
+        final Properties props = baseProps();
+        props.setProperty(StreamsConfig.MAX_TASK_IDLE_MS_CONFIG, "-1");
+
+        try (TopologyTestDriver driver = new TopologyTestDriver(builder.build(), props)) {
+            driver.declareTopic(inA, 4);
+            driver.declareTopic(inB, 2);
+            driver.init();
+
+            final TestInputTopic<String, String> pipeA =
+                driver.createInputTopic(inA, STRING_SER, STRING_SER);
+            final TestInputTopic<String, String> pipeB =
+                driver.createInputTopic(inB, STRING_SER, STRING_SER);
+
+            pipeA.pipeInput("alignedKey", "from-A");
+            pipeB.pipeInput("alignedKey", "from-B");
+            pipeA.pipeInput("onlyA", "from-A");
+            pipeB.pipeInput("onlyB", "from-B");
+
+            assertEquals(4, driver.partitionsOf("counts"));
+
+            final int alignedPart = BuiltInPartitioner.partitionForKey(STRING_SER.serialize(inA, "alignedKey"), 4);
+            final int onlyAPart   = BuiltInPartitioner.partitionForKey(STRING_SER.serialize(inA, "onlyA"), 4);
+            final int onlyBPart   = BuiltInPartitioner.partitionForKey(STRING_SER.serialize(inA, "onlyB"), 4);
+
+            assertEquals(Long.valueOf(2L),
+                driver.<String, Long>getKeyValueStore("counts", alignedPart).get("alignedKey"),
+                "alignedKey from inA and inB must co-locate on partition " + alignedPart);
+            assertEquals(Long.valueOf(1L),
+                driver.<String, Long>getKeyValueStore("counts", onlyAPart).get("onlyA"));
+            assertEquals(Long.valueOf(1L),
+                driver.<String, Long>getKeyValueStore("counts", onlyBPart).get("onlyB"));
+
+            // No leakage: alignedKey must not appear in any other partition. This is what
+            // proves the inB repartition actually aligned onto inA's layout — without it,
+            // the inA copy and the inB copy would land in different partitions.
+            for (int p = 0; p < 4; p++) {
+                if (p != alignedPart) {
+                    assertNull(driver.<String, Long>getKeyValueStore("counts", p).get("alignedKey"),
+                        "alignedKey leaked to partition " + p);
+                }
+            }
+        }
+    }
+
+    /**
+     * Footgun documentation: two sources with mismatching partition counts ({@code inA}=2,
+     * {@code inB}=3) feed the same {@code counts} store via {@link KStream#merge(KStream)} +
+     * {@code process()} — without any explicit {@link Repartitioned} alignment.
+     *
+     * <p>Production Kafka Streams does NOT raise a co-partition error here: the DSL only
+     * registers co-partition groups for joins (KStream-KStream, KStream-KTable, foreign-key),
+     * not for shared-store merges. The KIP-1238 {@link TopologyTestDriver} inherits the same
+     * blind spot, so {@code validateCopartitioning()} finds nothing to check and
+     * {@code init()} succeeds. The merged sub-topology then runs at
+     * {@code max(2, 3) = 3} partitions, and the same key arriving on both sources lands in
+     * two different store instances ({@code murmur2(k) % 2} on inA vs {@code murmur2(k) % 3}
+     * on inB), silently splitting the per-key state.</p>
+     *
+     * <p>This test pins that behaviour so any future change — stricter validation that throws,
+     * or a routing change that quietly fixes the split — is caught.</p>
+     */
+    @Test
+    public void mismatchedPartitionsAcrossSharedStoreSourcesSilentlySplitState() {
+        final String inA = "inA";  // 2 partitions
+        final String inB = "inB";  // 3 partitions
+
+        final StreamsBuilder builder = new StreamsBuilder();
+        builder.addStateStore(Stores.keyValueStoreBuilder(
+            Stores.inMemoryKeyValueStore("counts"),
+            Serdes.String(),
+            Serdes.Long()));
+
+        final KStream<String, String> streamA =
+            builder.stream(inA, Consumed.with(Serdes.String(), Serdes.String()));
+        final KStream<String, String> streamB =
+            builder.stream(inB, Consumed.with(Serdes.String(), Serdes.String()));
+
+        // No Repartitioned.withNumberOfPartitions(): both sources feed the same sub-topology
+        // and share the "counts" store, but no co-partition constraint is registered.
+        streamA.merge(streamB).process(CountIncrementer::new, "counts");
+
+        final Properties props = baseProps();
+        props.setProperty(StreamsConfig.MAX_TASK_IDLE_MS_CONFIG, "-1");
+
+        try (TopologyTestDriver driver = new TopologyTestDriver(builder.build(), props)) {
+            driver.declareTopic(inA, 2);
+            driver.declareTopic(inB, 3);
+            // init() must NOT throw: the DSL did not flag this merge as co-partitioned.
+            driver.init();
+
+            // Sub-topology partition count = max(2, 3) = 3.
+            assertEquals(3, driver.partitionsOf("counts"));
+
+            // Pick a key whose inA-side partition (murmur2 % 2) differs from its inB-side
+            // partition (murmur2 % 3), so the silent split is actually observable.
+            String key = null;
+            int partA = -1;
+            int partB = -1;
+            for (final String candidate : new String[] {"k", "key-1", "alpha", "beta", "gamma", "delta", "epsilon", "zeta"}) {
+                final int a = BuiltInPartitioner.partitionForKey(STRING_SER.serialize(inA, candidate), 2);
+                final int b = BuiltInPartitioner.partitionForKey(STRING_SER.serialize(inB, candidate), 3);
+                if (a != b) {
+                    key = candidate;
+                    partA = a;
+                    partB = b;
+                    break;
+                }
+            }
+            assertNotNull(key, "test setup: expected at least one candidate key with diverging partA/partB");
+
+            final TestInputTopic<String, String> pipeA =
+                driver.createInputTopic(inA, STRING_SER, STRING_SER);
+            final TestInputTopic<String, String> pipeB =
+                driver.createInputTopic(inB, STRING_SER, STRING_SER);
+
+            pipeA.pipeInput(key, "from-A");
+            pipeB.pipeInput(key, "from-B");
+
+            // The split: each side wrote to its own task's store instance, never the other.
+            assertEquals(Long.valueOf(1L),
+                driver.<String, Long>getKeyValueStore("counts", partA).get(key),
+                "inA must have incremented its own store partition " + partA);
+            assertEquals(Long.valueOf(1L),
+                driver.<String, Long>getKeyValueStore("counts", partB).get(key),
+                "inB must have incremented its own store partition " + partB);
+
+            // No co-localization: total across all 3 store partitions is 2, not (e.g.) 1+2 or 2+0.
+            long sum = 0;
+            for (int p = 0; p < 3; p++) {
+                final Long v = driver.<String, Long>getKeyValueStore("counts", p).get(key);
+                if (v != null) {
+                    sum += v;
+                }
+            }
+            assertEquals(2L, sum,
+                "the two single-source increments must have stayed isolated, total = 2");
+        }
+    }
+
+    /**
+     * PAPI processor used by {@link #coAlignedKeysAggregateAcrossSourcesAfterRepartition} and
+     * {@link #mismatchedPartitionsAcrossSharedStoreSourcesSilentlySplitState}. Increments
+     * {@code counts[key]} on every input record. No downstream forward.
+     */
+    private static final class CountIncrementer implements Processor<String, String, Void, Void> {
+        private KeyValueStore<String, Long> store;
+
+        @Override
+        public void init(final ProcessorContext<Void, Void> context) {
+            this.store = context.getStateStore("counts");
+        }
+
+        @Override
+        public void process(final Record<String, String> record) {
+            final Long current = store.get(record.key());
+            store.put(record.key(), (current == null ? 0L : current) + 1L);
+        }
+    }
 }
