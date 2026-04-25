@@ -109,6 +109,7 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -263,6 +264,11 @@ public class TopologyTestDriver implements Closeable {
     private final Map<String, Integer> subtopologyByInputTopic = new HashMap<>();
     private final Map<TopicPartition, TaskId> taskByTopicPartition = new HashMap<>();
     private final Map<String, Map<Integer, Queue<ProducerRecord<byte[], byte[]>>>> outputByTopicPartition = new HashMap<>();
+    private final java.util.TreeMap<TaskId, StreamTask> multiSubTasks = new java.util.TreeMap<>();
+    private StreamsConfig multiSubStreamsConfig;
+    private TaskConfig multiSubTaskConfig;
+    private StreamsMetricsImpl multiSubStreamsMetrics;
+    private ThreadCache multiSubCache;
 
     private final StateRestoreListener stateRestoreListener = new StateRestoreListener() {
         @Override
@@ -377,6 +383,12 @@ public class TopologyTestDriver implements Closeable {
 
         setupGlobalTask(mockWallClockTime, streamsConfig, streamsMetrics, cache);
         setupTask(streamsConfig, streamsMetrics, cache, internalTopologyBuilder.topologyConfigs().getTaskConfig());
+
+        // Capture references the multi-sub-topology runtime path (KIP-1238) needs at init() time.
+        this.multiSubStreamsConfig = streamsConfig;
+        this.multiSubTaskConfig = internalTopologyBuilder.topologyConfigs().getTaskConfig();
+        this.multiSubStreamsMetrics = streamsMetrics;
+        this.multiSubCache = cache;
     }
 
     private static void logIfTaskIdleEnabled(final StreamsConfig streamsConfig) {
@@ -928,7 +940,122 @@ public class TopologyTestDriver implements Closeable {
             partitionsBySubtopology.put(sid, max);
         }
 
+        // 5. Build one StreamTask per (sid, partition) using the shared MockConsumer/MockProducer.
+        setupMultiSubTasks();
+
         initialized = true;
+    }
+
+    /**
+     * Build one {@link StreamTask} per {@code (subtopologyId, partition)} pair using the structures
+     * computed by {@link #init()}. All tasks share the driver's single {@link #consumer} and the
+     * {@link #testDriverProducer} as their record collector's producer.
+     */
+    private void setupMultiSubTasks() {
+        final MockConsumer<byte[], byte[]> sharedConsumer = consumer;
+        final List<TopicPartition> allSourcePartitions = new ArrayList<>();
+        final String threadId = Thread.currentThread().getName();
+
+        for (final int sid : subtopologyIds) {
+            final ProcessorTopology pt = subtopologyTopologies.get(sid);
+            if (pt.sourceTopics().isEmpty()) {
+                continue;
+            }
+            final int numPartitions = partitionsBySubtopology.getOrDefault(sid, 1);
+
+            // Register an offset counter for every (source-topic, partition) the sub-topology consumes.
+            for (final String src : pt.sourceTopics()) {
+                final int n = declaredPartitionsByTopic.getOrDefault(src, 1);
+                for (int p = 0; p < n; p++) {
+                    final TopicPartition tp = new TopicPartition(src, p);
+                    offsetsByTopicOrPatternPartition.putIfAbsent(tp, new AtomicLong());
+                    allSourcePartitions.add(tp);
+                }
+            }
+
+            for (int p = 0; p < numPartitions; p++) {
+                buildOneMultiSubTask(sid, p, pt, sharedConsumer, threadId);
+            }
+        }
+
+        if (!allSourcePartitions.isEmpty()) {
+            sharedConsumer.assign(allSourcePartitions);
+            final Map<TopicPartition, Long> startOffsets = new HashMap<>();
+            for (final TopicPartition tp : allSourcePartitions) {
+                startOffsets.put(tp, 0L);
+            }
+            sharedConsumer.updateBeginningOffsets(startOffsets);
+            sharedConsumer.updateEndOffsets(startOffsets);
+        }
+    }
+
+    private void buildOneMultiSubTask(final int sid,
+                                      final int partition,
+                                      final ProcessorTopology pt,
+                                      final MockConsumer<byte[], byte[]> sharedConsumer,
+                                      final String threadId) {
+        final TaskId taskId = new TaskId(sid, partition);
+        TaskMetrics.droppedRecordsSensor(threadId, taskId.toString(), multiSubStreamsMetrics);
+
+        // This task owns partition {@code p} of each source topic that has at least p+1 partitions.
+        final Set<TopicPartition> inputPartitions = new HashSet<>();
+        for (final String src : pt.sourceTopics()) {
+            final int n = declaredPartitionsByTopic.getOrDefault(src, 1);
+            if (partition < n) {
+                final TopicPartition tp = new TopicPartition(src, partition);
+                inputPartitions.add(tp);
+                taskByTopicPartition.put(tp, taskId);
+            }
+        }
+        if (inputPartitions.isEmpty()) {
+            return;
+        }
+
+        final ProcessorStateManager stateManager = new ProcessorStateManager(
+            taskId,
+            Task.TaskType.ACTIVE,
+            StreamsConfig.EXACTLY_ONCE_V2.equals(multiSubStreamsConfig.getString(StreamsConfig.PROCESSING_GUARANTEE_CONFIG)),
+            logContext,
+            stateDirectory,
+            new MockChangelogRegister(),
+            pt.storeToChangelogTopic(),
+            new HashSet<>(inputPartitions),
+            false);
+        final RecordCollector recordCollector = new RecordCollectorImpl(
+            logContext,
+            taskId,
+            testDriverProducer,
+            multiSubStreamsConfig.productionExceptionHandler(),
+            multiSubStreamsMetrics,
+            pt
+        );
+        final InternalProcessorContext<?, ?> context = new ProcessorContextImpl(
+            taskId,
+            multiSubStreamsConfig,
+            stateManager,
+            multiSubStreamsMetrics,
+            multiSubCache
+        );
+        final StreamTask task = new StreamTask(
+            taskId,
+            new HashSet<>(inputPartitions),
+            pt,
+            sharedConsumer,
+            multiSubTaskConfig,
+            multiSubStreamsMetrics,
+            stateDirectory,
+            multiSubCache,
+            mockWallClockTime,
+            stateManager,
+            recordCollector,
+            context,
+            logContext,
+            false
+        );
+        task.initializeIfNeeded();
+        task.completeRestoration(noOpResetter -> { });
+        task.processorContext().setRecordContext(null);
+        multiSubTasks.put(taskId, task);
     }
 
     /**
