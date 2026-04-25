@@ -1442,7 +1442,12 @@ public class TopologyTestDriver implements Closeable {
         }
         final K key = keyDeserializer.deserialize(record.topic(), record.headers(), record.key());
         final V value = valueDeserializer.deserialize(record.topic(), record.headers(), record.value());
-        return new TestRecord<>(key, value, record.headers(), record.timestamp());
+        // KIP-1238: when the multi-sub-topology runtime is active, propagate the partition that
+        // the driver actually routed/stamped (see captureOutputsMultiSub). The legacy single-task
+        // path keeps partition=null on the returned TestRecord to preserve byte-identical
+        // behaviour for pre-KIP-1238 tests that compare full TestRecords by equals().
+        final Integer outputPartition = initialized ? record.partition() : null;
+        return new TestRecord<>(key, value, record.headers(), record.timestamp(), outputPartition);
     }
 
     <K, V> void pipeRecord(final String topic,

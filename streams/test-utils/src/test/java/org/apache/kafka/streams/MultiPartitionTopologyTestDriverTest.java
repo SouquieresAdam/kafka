@@ -22,11 +22,13 @@ import org.apache.kafka.common.serialization.Serdes;
 import org.apache.kafka.common.serialization.StringDeserializer;
 import org.apache.kafka.common.serialization.StringSerializer;
 import org.apache.kafka.streams.kstream.Consumed;
+import org.apache.kafka.streams.kstream.GlobalKTable;
 import org.apache.kafka.streams.kstream.Grouped;
 import org.apache.kafka.streams.kstream.KStream;
 import org.apache.kafka.streams.kstream.Materialized;
 import org.apache.kafka.streams.kstream.Produced;
 import org.apache.kafka.streams.kstream.Repartitioned;
+import org.apache.kafka.streams.processor.PunctuationType;
 import org.apache.kafka.streams.processor.api.Processor;
 import org.apache.kafka.streams.processor.api.ProcessorContext;
 import org.apache.kafka.streams.processor.api.Record;
@@ -36,6 +38,7 @@ import org.apache.kafka.streams.test.TestRecord;
 
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Properties;
@@ -591,6 +594,194 @@ public class MultiPartitionTopologyTestDriverTest {
             }
             assertEquals(2L, sum,
                 "the two single-source increments must have stayed isolated, total = 2");
+        }
+    }
+
+    /**
+     * Verifies that {@link TopologyTestDriver#advanceWallClockTime(Duration)} fans out across every
+     * {@code StreamTask} in the multi-sub-topology graph. The topology has two disjoint
+     * sub-topologies with different partition counts ({@code inA}=3, {@code inB}=2), giving
+     * {@code 3 + 2 = 5} tasks total. Each side's PAPI processor schedules a
+     * {@link PunctuationType#WALL_CLOCK_TIME wall-clock} punctuator at {@code init()} time that
+     * increments a partition-local counter. After a single {@code advanceWallClockTime} call no
+     * record is piped, so the only way each store partition can hold a non-zero count is if the
+     * punctuator fired in that specific task.
+     */
+    @Test
+    public void advanceWallClockTimeFiresPunctuatorsAcrossAllTasks() {
+        final String inA = "inA";  // 3 partitions → 3 tasks for sub-topology A
+        final String inB = "inB";  // 2 partitions → 2 tasks for sub-topology B
+
+        final StreamsBuilder builder = new StreamsBuilder();
+        builder.addStateStore(Stores.keyValueStoreBuilder(
+            Stores.inMemoryKeyValueStore("punctA"),
+            Serdes.String(),
+            Serdes.Long()));
+        builder.addStateStore(Stores.keyValueStoreBuilder(
+            Stores.inMemoryKeyValueStore("punctB"),
+            Serdes.String(),
+            Serdes.Long()));
+
+        builder.stream(inA, Consumed.with(Serdes.String(), Serdes.String()))
+            .process(() -> new WallClockPunctuatorCounter("punctA"), "punctA");
+        builder.stream(inB, Consumed.with(Serdes.String(), Serdes.String()))
+            .process(() -> new WallClockPunctuatorCounter("punctB"), "punctB");
+
+        try (TopologyTestDriver driver = new TopologyTestDriver(builder.build(), baseProps())) {
+            driver.declareTopic(inA, 3);
+            driver.declareTopic(inB, 2);
+            driver.init();
+
+            // Sanity check the task fan-out: 3 partitions on A + 2 partitions on B.
+            assertEquals(3, driver.partitionsOf("punctA"));
+            assertEquals(2, driver.partitionsOf("punctB"));
+
+            // No pipeInput: punctuators are scheduled when the task initializes its processors,
+            // which already happened during driver.init(). A single advance past the 100ms
+            // schedule period must trigger the wall-clock punctuator on every task.
+            driver.advanceWallClockTime(Duration.ofMillis(250));
+
+            for (int p = 0; p < 3; p++) {
+                final KeyValueStore<String, Long> store = driver.getKeyValueStore("punctA", p);
+                assertNotNull(store, "punctA store missing at partition " + p);
+                final Long ticks = store.get("ticks");
+                assertNotNull(ticks,
+                    "wall-clock punctuator did not fire on sub-topology A, partition " + p);
+                assertTrue(ticks >= 1L,
+                    "punctA partition " + p + " expected >=1 tick, got " + ticks);
+            }
+            for (int p = 0; p < 2; p++) {
+                final KeyValueStore<String, Long> store = driver.getKeyValueStore("punctB", p);
+                assertNotNull(store, "punctB store missing at partition " + p);
+                final Long ticks = store.get("ticks");
+                assertNotNull(ticks,
+                    "wall-clock punctuator did not fire on sub-topology B, partition " + p);
+                assertTrue(ticks >= 1L,
+                    "punctB partition " + p + " expected >=1 tick, got " + ticks);
+            }
+        }
+    }
+
+    /**
+     * Verifies the active-task / global-task hand-off when the regular sub-topology runs across
+     * several partitions. A {@link GlobalKTable} on {@code dim} is fed first so the global store
+     * is populated, then a multi-partition {@code facts} stream joins against it via
+     * {@link KStream#join(GlobalKTable, org.apache.kafka.streams.kstream.KeyValueMapper,
+     * org.apache.kafka.streams.kstream.ValueJoiner)}.
+     *
+     * <p>The test is meaningful because the {@code facts} keys are picked so they hash to several
+     * different partitions of {@code facts} (verified at runtime), which means several distinct
+     * {@code StreamTask}s perform the global lookup. If the multi-sub init failed to share the
+     * global state with regular tasks &mdash; or if {@code pipeRecord} on the global topic stopped
+     * routing through {@code GlobalStateUpdateTask} &mdash; the join would produce {@code null} on
+     * the dim side and the joined value would be wrong (or absent).</p>
+     */
+    @Test
+    public void globalKTableJoinFedFromGlobalTaskIsVisibleToEveryActiveTask() {
+        final String factsTopic = "facts";   // 4 partitions → 4 active StreamTasks
+        final String dimTopic = "dim";        // global, single partition by KIP-1238 contract
+        final String outTopic = "out";        // 4 partitions, mirrors facts to keep routing simple
+
+        final StreamsBuilder builder = new StreamsBuilder();
+        final GlobalKTable<String, String> dim = builder.globalTable(
+            dimTopic,
+            Consumed.with(Serdes.String(), Serdes.String()),
+            Materialized.as("dimStore"));
+
+        builder.stream(factsTopic, Consumed.with(Serdes.String(), Serdes.String()))
+            .join(dim, (factKey, factVal) -> factKey, (factVal, dimVal) -> factVal + "+" + dimVal)
+            .to(outTopic, Produced.with(Serdes.String(), Serdes.String()));
+
+        try (TopologyTestDriver driver = new TopologyTestDriver(builder.build(), baseProps())) {
+            // dim is global, so it must NOT be declared via declareTopic — that path is for active
+            // sub-topology inputs. The driver discovers dim from globalTopology.sourceTopics().
+            driver.declareTopic(factsTopic, 4);
+            driver.declareTopic(outTopic, 4);
+            driver.init();
+
+            // Step 1: feed the global table. pipeRecord routes via GlobalStateUpdateTask.
+            final TestInputTopic<String, String> dimPipe =
+                driver.createInputTopic(dimTopic, STRING_SER, STRING_SER);
+            final String[] keys = {"alpha", "beta", "gamma", "delta", "epsilon"};
+            for (final String k : keys) {
+                dimPipe.pipeInput(k, "DIM(" + k + ")");
+            }
+
+            // Cross-check: the global store reports 1 partition and is reachable via the
+            // no-arg accessor (there is no ambiguity for globals in the multi-sub path).
+            assertEquals(1, driver.partitionsOf("dimStore"),
+                "global stores must report a single partition (KIP-1238 contract)");
+            final KeyValueStore<String, String> globalStore = driver.getKeyValueStore("dimStore");
+            assertNotNull(globalStore, "global dimStore should be reachable without partition arg");
+            for (final String k : keys) {
+                assertEquals("DIM(" + k + ")", globalStore.get(k),
+                    "global store must contain key '" + k + "' after pipeRecord on the global topic");
+            }
+
+            // Step 2: pipe facts on the multi-partition stream side. Capture which fact-side
+            // partition each key lands on so the test can verify multiple tasks were exercised.
+            final TestInputTopic<String, String> factsPipe =
+                driver.createInputTopic(factsTopic, STRING_SER, STRING_SER);
+
+            final java.util.Set<Integer> hostedPartitions = new java.util.HashSet<>();
+            for (final String k : keys) {
+                factsPipe.pipeInput(k, "FACT(" + k + ")");
+                hostedPartitions.add(BuiltInPartitioner.partitionForKey(STRING_SER.serialize(factsTopic, k), 4));
+            }
+            assertTrue(hostedPartitions.size() >= 2,
+                "test setup: the fact keys must span >=2 facts partitions to exercise more than "
+                    + "one StreamTask, but they all landed on " + hostedPartitions);
+
+            // Step 3: every fact must produce a joined output (FACT+DIM). With the multi-sub
+            // runtime active, TestOutputTopic.readRecord propagates the routed partition on the
+            // TestRecord. Indexing by key removes any cross-partition ordering assumption; we
+            // then assert join result AND the output's partition matching the source-side hash
+            // partition (which proves the join ran inside the right task).
+            final TestOutputTopic<String, String> outPipe =
+                driver.createOutputTopic(outTopic, STRING_DES, STRING_DES);
+            final Map<String, String> joined = new HashMap<>();
+            final Map<String, Integer> joinedPartition = new HashMap<>();
+            for (int i = 0; i < keys.length; i++) {
+                final TestRecord<String, String> rec = outPipe.readRecord();
+                assertNotNull(rec, "missing joined record #" + i + " on " + outTopic);
+                joined.put(rec.getKey(), rec.getValue());
+                joinedPartition.put(rec.getKey(), rec.partition());
+            }
+            for (final String k : keys) {
+                assertEquals("FACT(" + k + ")+DIM(" + k + ")", joined.get(k),
+                    "stream-globalTable join must enrich '" + k + "' with the global value");
+                final int expected = BuiltInPartitioner.partitionForKey(STRING_SER.serialize(factsTopic, k), 4);
+                assertEquals(Integer.valueOf(expected), joinedPartition.get(k),
+                    "join output for key '" + k + "' should preserve the source-side partition");
+            }
+        }
+    }
+
+    /**
+     * PAPI processor used by {@link #advanceWallClockTimeFiresPunctuatorsAcrossAllTasks}. Schedules
+     * a wall-clock punctuator at {@code init()} time that bumps a partition-local
+     * {@code "ticks"} counter inside the configured store on every firing.
+     */
+    private static final class WallClockPunctuatorCounter implements Processor<String, String, Void, Void> {
+        private final String storeName;
+        private KeyValueStore<String, Long> store;
+
+        WallClockPunctuatorCounter(final String storeName) {
+            this.storeName = storeName;
+        }
+
+        @Override
+        public void init(final ProcessorContext<Void, Void> context) {
+            this.store = context.getStateStore(storeName);
+            context.schedule(Duration.ofMillis(100), PunctuationType.WALL_CLOCK_TIME, ts -> {
+                final Long current = store.get("ticks");
+                store.put("ticks", (current == null ? 0L : current) + 1L);
+            });
+        }
+
+        @Override
+        public void process(final Record<String, String> record) {
+            // unused: the test never pipes records.
         }
     }
 
