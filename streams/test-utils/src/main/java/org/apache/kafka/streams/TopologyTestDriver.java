@@ -777,7 +777,7 @@ public class TopologyTestDriver implements Closeable {
         if (initialized) {
             for (final StreamTask t : multiSubTasks.values()) {
                 t.maybePunctuateSystemTime();
-                commit(t.prepareCommit());
+                commit(t.prepareCommit(true));
                 t.postCommit(true);
             }
             completeAllProcessableWorkMultiSub();
@@ -1071,10 +1071,8 @@ public class TopologyTestDriver implements Closeable {
             StreamsConfig.EXACTLY_ONCE_V2.equals(multiSubStreamsConfig.getString(StreamsConfig.PROCESSING_GUARANTEE_CONFIG)),
             logContext,
             stateDirectory,
-            new MockChangelogRegister(),
             pt.storeToChangelogTopic(),
-            new HashSet<>(inputPartitions),
-            false);
+            new HashSet<>(inputPartitions));
         final RecordCollector recordCollector = new RecordCollectorImpl(
             logContext,
             taskId,
@@ -1330,7 +1328,7 @@ public class TopologyTestDriver implements Closeable {
             next.updateLags();
             next.process(mockWallClockTime.milliseconds());
             next.maybePunctuateStreamTime();
-            commit(next.prepareCommit());
+            commit(next.prepareCommit(true));
             next.postCommit(true);
             captureOutputsMultiSub();
         }
@@ -2109,7 +2107,7 @@ public class TopologyTestDriver implements Closeable {
         for (final StreamTask t : multiSubTasks.values()) {
             try {
                 t.suspend();
-                t.prepareCommit();
+                t.prepareCommit(true);
                 t.postCommit(true);
                 t.closeClean();
             } catch (final RuntimeException e) {
