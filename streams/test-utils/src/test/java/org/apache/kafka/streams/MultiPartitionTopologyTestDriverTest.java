@@ -17,13 +17,19 @@
 package org.apache.kafka.streams;
 
 import org.apache.kafka.clients.producer.internals.BuiltInPartitioner;
+import org.apache.kafka.common.serialization.LongDeserializer;
 import org.apache.kafka.common.serialization.Serdes;
 import org.apache.kafka.common.serialization.StringDeserializer;
 import org.apache.kafka.common.serialization.StringSerializer;
 import org.apache.kafka.streams.kstream.Consumed;
 import org.apache.kafka.streams.kstream.Grouped;
+import org.apache.kafka.streams.kstream.KStream;
 import org.apache.kafka.streams.kstream.Materialized;
 import org.apache.kafka.streams.kstream.Produced;
+import org.apache.kafka.streams.kstream.Repartitioned;
+import org.apache.kafka.streams.processor.api.Processor;
+import org.apache.kafka.streams.processor.api.ProcessorContext;
+import org.apache.kafka.streams.processor.api.Record;
 import org.apache.kafka.streams.state.KeyValueStore;
 import org.apache.kafka.streams.state.Stores;
 import org.apache.kafka.streams.test.TestRecord;
@@ -35,6 +41,7 @@ import java.util.Map;
 import java.util.Properties;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -274,6 +281,144 @@ public class MultiPartitionTopologyTestDriverTest {
                 driver.createOutputTopic(OUT_TOPIC, STRING_DES, STRING_DES);
             in.pipeInput("k", "v");
             assertEquals("v", out.readValue());
+        }
+    }
+
+    /**
+     * Exercises four KIP-1238 concerns at once with a single topology:
+     * <ul>
+     *   <li><b>Two sources with different partition counts:</b> {@code inA} at 4 partitions
+     *       feeds sub-topology A; {@code inB} at 2 partitions feeds sub-topology B.</li>
+     *   <li><b>Two sinks with different partition counts:</b> {@code outA} at 4 partitions
+     *       (preserves source A's partitioning); {@code outB} at 3 partitions (after the
+     *       explicit repartition).</li>
+     *   <li><b>An explicit per-link repartition count:</b> the path from {@code inB} goes
+     *       through {@link Repartitioned#withNumberOfPartitions(int)
+     *       Repartitioned.withNumberOfPartitions(3)}, so the repartition topic and the
+     *       downstream sub-topology are pinned at 3 partitions, independent of the
+     *       2-partition source.</li>
+     *   <li><b>Two processors sharing the same state store:</b> on sub-topology A, two
+     *       chained PAPI {@link Processor}s both reference the {@code shared} key-value store
+     *       and read/write the same partition-local instance. After one input record on
+     *       {@code inA}, the store at the source partition holds 2 (each processor
+     *       incremented once).</li>
+     * </ul>
+     * Sub-topologies A and B are deliberately disjoint: a state store cannot be shared
+     * across sub-topologies (only globals can), and putting both sources in the same
+     * sub-topology would force them to be co-partitioned, defeating the
+     * "different input partition counts" goal.
+     */
+    @Test
+    public void twoSourcesTwoSinksDifferentPartitionsAndExplicitRepartitionAndSharedStore() {
+        final String inA = "inA";    // source A: 4 partitions
+        final String inB = "inB";    // source B: 2 partitions
+        final String outA = "outA";  // sink A: 4 partitions (preserves source A)
+        final String outB = "outB";  // sink B: 3 partitions (after explicit repartition)
+
+        final StreamsBuilder builder = new StreamsBuilder();
+        builder.addStateStore(Stores.keyValueStoreBuilder(
+            Stores.inMemoryKeyValueStore("shared"),
+            Serdes.String(),
+            Serdes.Long()));
+
+        // Sub-topology A: inA fans out to TWO PAPI processors in parallel; both reference the same
+        // "shared" store name, so they share the partition-local store instance. The first
+        // processor's output is intentionally discarded — only its store side-effect matters; the
+        // second processor's output goes to outA.
+        final KStream<String, String> streamA =
+            builder.stream(inA, Consumed.with(Serdes.String(), Serdes.String()));
+        streamA.process(SharedStoreCounter::new, "shared");
+        streamA
+            .process(SharedStoreCounter::new, "shared")
+            .to(outA, Produced.with(Serdes.String(), Serdes.Long()));
+
+        // Sub-topology B: inB → explicit repartition(3) → outB. No state store; just verifies
+        // the explicit partition count propagates from the Repartitioned config to the sink.
+        final KStream<String, String> streamB =
+            builder.stream(inB, Consumed.with(Serdes.String(), Serdes.String()));
+        streamB
+            .repartition(Repartitioned.<String, String>with(Serdes.String(), Serdes.String())
+                .withNumberOfPartitions(3))
+            .to(outB, Produced.with(Serdes.String(), Serdes.String()));
+
+        try (TopologyTestDriver driver = new TopologyTestDriver(builder.build(), baseProps())) {
+            driver.declareTopic(inA, 4);
+            driver.declareTopic(inB, 2);
+            driver.declareTopic(outA, 4);
+            driver.declareTopic(outB, 3);
+            driver.init();
+
+            // Pipe one record on inA. procA1 reads store=null, writes 1, forwards (k, 1L).
+            // procA2 reads store=1, writes 2, forwards (k, 2L). Final store at source partition = 2.
+            final TestInputTopic<String, String> pipeA =
+                driver.createInputTopic(inA, STRING_SER, STRING_SER);
+            pipeA.pipeInput("k", "v");
+
+            final int srcPartA = BuiltInPartitioner.partitionForKey(STRING_SER.serialize(inA, "k"), 4);
+            final KeyValueStore<String, Long> sharedStore =
+                driver.getKeyValueStore("shared", srcPartA);
+            assertNotNull(sharedStore, "shared store should exist at source partition " + srcPartA);
+            assertEquals(Long.valueOf(2L), sharedStore.get("k"),
+                "both PAPI processors share the same store instance and each incremented once");
+
+            // Pipe one record on inB. It traverses the explicit repartition(3) and lands on outB.
+            final TestInputTopic<String, String> pipeB =
+                driver.createInputTopic(inB, STRING_SER, STRING_SER);
+            pipeB.pipeInput("k2", "vb");
+
+            // Verify the partition counts of each sub-topology. Sub-topology A inherits 4 from
+            // inA; sub-topology B's downstream side is pinned at 3 by Repartitioned.
+            int sidA = -1;
+            int sidB = -1;
+            for (final int sid : driver.subtopologies()) {
+                final int n = driver.partitionsOfSubtopology(sid);
+                if (n == 4) {
+                    sidA = sid;
+                } else if (n == 3) {
+                    sidB = sid;
+                }
+            }
+            assertTrue(sidA >= 0, "expected one sub-topology with 4 partitions (source A side)");
+            assertTrue(sidB >= 0, "expected one sub-topology with 3 partitions (post-repartition side)");
+            assertNotEqualsInt(sidA, sidB, "the two sub-topologies must be distinct");
+
+            // Both sinks emit. outA produced (k, 2L) and outB produced (k2, "vb").
+            final TestOutputTopic<String, Long> readA =
+                driver.createOutputTopic(outA, STRING_DES, new LongDeserializer());
+            final TestOutputTopic<String, String> readB =
+                driver.createOutputTopic(outB, STRING_DES, STRING_DES);
+            assertFalse(readA.isEmpty(), "outA should have received a record");
+            assertFalse(readB.isEmpty(), "outB should have received a record (post-repartition)");
+        }
+    }
+
+    private static void assertNotEqualsInt(final int a, final int b, final String message) {
+        if (a == b) {
+            throw new AssertionError(message + ": both equal " + a);
+        }
+    }
+
+    /**
+     * PAPI processor used by
+     * {@link #twoSourcesTwoSinksDifferentPartitionsAndExplicitRepartitionAndSharedStore}.
+     * Increments the {@code shared} key-value store on every record and forwards the new count.
+     */
+    private static final class SharedStoreCounter implements Processor<String, String, String, Long> {
+        private KeyValueStore<String, Long> store;
+        private ProcessorContext<String, Long> ctx;
+
+        @Override
+        public void init(final ProcessorContext<String, Long> context) {
+            this.ctx = context;
+            this.store = context.getStateStore("shared");
+        }
+
+        @Override
+        public void process(final Record<String, String> record) {
+            final Long current = store.get(record.key());
+            final long next = (current == null ? 0L : current) + 1L;
+            store.put(record.key(), next);
+            ctx.forward(record.withValue(next));
         }
     }
 }

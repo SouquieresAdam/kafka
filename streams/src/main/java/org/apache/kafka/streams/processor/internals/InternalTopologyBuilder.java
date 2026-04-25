@@ -1303,6 +1303,23 @@ public class InternalTopologyBuilder {
         return null;
     }
 
+    /**
+     * Visible for KIP-1238 multi-partition {@code TopologyTestDriver}. Not part of the public API.
+     *
+     * @return a mapping from each internal repartition topic name to its explicitly-configured
+     *         number of partitions (e.g. via {@code Repartitioned.withNumberOfPartitions}). Topics
+     *         whose count is left to upstream inheritance are absent from the map.
+     */
+    public synchronized Map<String, Integer> explicitRepartitionTopicPartitionCounts() {
+        final Map<String, Integer> result = new HashMap<>();
+        for (final TopicsInfo info : subtopologyToTopicsInfo().values()) {
+            for (final Map.Entry<String, InternalTopicConfig> entry : info.repartitionSourceTopics.entrySet()) {
+                entry.getValue().numberOfPartitions().ifPresent(n -> result.put(entry.getKey(), n));
+            }
+        }
+        return Collections.unmodifiableMap(result);
+    }
+
     public Map<String, List<String>> nodeToSourceTopics() {
         return Collections.unmodifiableMap(nodeToSourceTopics);
     }

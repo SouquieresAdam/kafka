@@ -958,6 +958,14 @@ public class TopologyTestDriver implements Closeable {
         for (final Set<String> ts : repartByPid.values()) {
             allInternalRepartitionTopics.addAll(ts);
         }
+        // Layer 0 of the partition resolution: any repartition topic the topology builder has
+        // already pinned (e.g. via Repartitioned.withNumberOfPartitions(N)) takes precedence
+        // over our 3-layer rule. Seed declaredPartitionsByTopic so the upstream-max layer does
+        // not overwrite a user-explicit count.
+        for (final Map.Entry<String, Integer> entry :
+                internalTopologyBuilder.explicitRepartitionTopicPartitionCounts().entrySet()) {
+            declaredPartitionsByTopic.putIfAbsent(entry.getKey(), entry.getValue());
+        }
         subtopologyIds.addAll(repartByPid.keySet());
         Collections.sort(subtopologyIds);
         for (final int sid : subtopologyIds) {
