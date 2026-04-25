@@ -253,6 +253,17 @@ public class TopologyTestDriver implements Closeable {
     private final Map<String, Queue<ProducerRecord<byte[], byte[]>>> outputRecordsByTopic = new HashMap<>();
     private final StreamsConfigUtils.ProcessingMode processingMode;
 
+    // KIP-1238 multi-partition lifecycle (declareTopic/init). The fields below back the new API only;
+    // the legacy single-partition execution path does not consult them and continues to work unchanged.
+    private final Map<String, Integer> declaredPartitionsByTopic = new HashMap<>();
+    private boolean initialized = false;
+    private final List<Integer> subtopologyIds = new ArrayList<>();
+    private final Map<Integer, ProcessorTopology> subtopologyTopologies = new HashMap<>();
+    private final Map<Integer, Integer> partitionsBySubtopology = new HashMap<>();
+    private final Map<String, Integer> subtopologyByInputTopic = new HashMap<>();
+    private final Map<TopicPartition, TaskId> taskByTopicPartition = new HashMap<>();
+    private final Map<String, Map<Integer, Queue<ProducerRecord<byte[], byte[]>>>> outputByTopicPartition = new HashMap<>();
+
     private final StateRestoreListener stateRestoreListener = new StateRestoreListener() {
         @Override
         public void onRestoreStart(final TopicPartition topicPartition, final String storeName, final long startingOffset, final long endingOffset) {}
@@ -764,6 +775,26 @@ public class TopologyTestDriver implements Closeable {
     }
 
     /**
+     * Create a {@link TestInputTopic} for a multi-partition topic (KIP-1238). The partition count is
+     * declared as if {@link #declareTopic(String, int)} had been called.
+     *
+     * @param topicName the name of the topic
+     * @param keySerializer the {@link Serializer} for the key type
+     * @param valueSerializer the {@link Serializer} for the value type
+     * @param partitions the number of partitions to simulate for this topic (must be at least 1)
+     * @param <K> the key type
+     * @param <V> the value type
+     * @return a {@link TestInputTopic} configured for this topic
+     */
+    public final <K, V> TestInputTopic<K, V> createInputTopic(final String topicName,
+                                                              final Serializer<K> keySerializer,
+                                                              final Serializer<V> valueSerializer,
+                                                              final int partitions) {
+        declareTopic(topicName, partitions);
+        return createInputTopic(topicName, keySerializer, valueSerializer);
+    }
+
+    /**
      * Create {@link TestInputTopic} to be used for piping records to topic
      * Uses provided start timestamp and autoAdvance parameter for records
      *
@@ -798,6 +829,236 @@ public class TopologyTestDriver implements Closeable {
                                                                 final Deserializer<K> keyDeserializer,
                                                                 final Deserializer<V> valueDeserializer) {
         return new TestOutputTopic<>(this, topicName, keyDeserializer, valueDeserializer);
+    }
+
+    /**
+     * Create a {@link TestOutputTopic} for a multi-partition topic (KIP-1238). The partition count is
+     * declared as if {@link #declareTopic(String, int)} had been called.
+     *
+     * @param topicName the name of the topic
+     * @param keyDeserializer the {@link Deserializer} for the key type
+     * @param valueDeserializer the {@link Deserializer} for the value type
+     * @param partitions the number of partitions to simulate for this topic (must be at least 1)
+     * @param <K> the key type
+     * @param <V> the value type
+     * @return a {@link TestOutputTopic} configured for this topic
+     */
+    public final <K, V> TestOutputTopic<K, V> createOutputTopic(final String topicName,
+                                                                final Deserializer<K> keyDeserializer,
+                                                                final Deserializer<V> valueDeserializer,
+                                                                final int partitions) {
+        declareTopic(topicName, partitions);
+        return createOutputTopic(topicName, keyDeserializer, valueDeserializer);
+    }
+
+    /**
+     * Declare the number of partitions for an input, output, or generated repartition topic (KIP-1238).
+     * Must be called before any record is piped. Subsequent calls with the same count are no-ops; calls
+     * with a different count throw {@link IllegalArgumentException}. Calls after the driver has been
+     * implicitly initialised (i.e. after the first pipe) throw {@link IllegalStateException}.
+     *
+     * @param topicName the topic to declare
+     * @param partitions the number of partitions (must be at least 1)
+     * @throws IllegalStateException if the driver has already been initialised
+     * @throws IllegalArgumentException if {@code partitions} is less than 1, or the topic was already
+     *         declared with a different count
+     */
+    public void declareTopic(final String topicName, final int partitions) {
+        Objects.requireNonNull(topicName, "topicName cannot be null");
+        if (initialized) {
+            throw new IllegalStateException(
+                "Cannot declare topic '" + topicName + "' after the driver has been initialised; "
+                    + "declare all multi-partition topics before piping records.");
+        }
+        if (partitions < 1) {
+            throw new IllegalArgumentException(
+                "Partition count must be at least 1 (topic='" + topicName + "', partitions=" + partitions + ").");
+        }
+        final Integer existing = declaredPartitionsByTopic.get(topicName);
+        if (existing != null && existing != partitions) {
+            throw new IllegalArgumentException(
+                "Topic '" + topicName + "' was already declared with " + existing
+                    + " partitions; cannot redeclare with " + partitions + ".");
+        }
+        declaredPartitionsByTopic.put(topicName, partitions);
+    }
+
+    /**
+     * Mark the driver as initialised (KIP-1238). Idempotent. Call this after declaring all multi-partition
+     * topics and before piping records. The single-partition back-compat path auto-initialises on first use,
+     * so existing tests do not need to call this method.
+     *
+     * <p>This builds the sub-topology task graph: for each sub-topology, it constructs its
+     * {@link ProcessorTopology}, resolves the partition count of any internal repartition topic
+     * (declared explicit count &gt; co-partition group inheritance &gt; max upstream sources &gt;
+     * fallback to 1), validates co-partitioning, and computes the per-sub-topology partition count
+     * as the max across its source topics. The runtime task instances themselves are still created
+     * lazily by the legacy execution path; KIP-1238 Pass 5 will switch the runtime over.</p>
+     */
+    public void init() {
+        if (initialized) {
+            return;
+        }
+
+        // 1. Enumerate sub-topology IDs and build each ProcessorTopology individually.
+        subtopologyIds.addAll(internalTopologyBuilder.subtopologyToRepartitionTopics().keySet());
+        Collections.sort(subtopologyIds);
+        for (final int sid : subtopologyIds) {
+            final ProcessorTopology pt = internalTopologyBuilder.buildSubtopology(sid);
+            subtopologyTopologies.put(sid, pt);
+            for (final String src : pt.sourceTopics()) {
+                subtopologyByInputTopic.put(src, sid);
+                declaredPartitionsByTopic.putIfAbsent(src, 1);
+            }
+        }
+
+        // 2. Resolve internal repartition topic partition counts (3-layer rule + fallback).
+        resolveInternalRepartitionTopicPartitions();
+
+        // 3. Validate co-partitioning.
+        validateCopartitioning();
+
+        // 4. Compute partition count per sub-topology (max across source topics).
+        for (final int sid : subtopologyIds) {
+            final ProcessorTopology pt = subtopologyTopologies.get(sid);
+            int max = 1;
+            for (final String src : pt.sourceTopics()) {
+                max = Math.max(max, declaredPartitionsByTopic.getOrDefault(src, 1));
+            }
+            partitionsBySubtopology.put(sid, max);
+        }
+
+        initialized = true;
+    }
+
+    /**
+     * Resolve partition counts for internal repartition topics using the 3-layer rule:
+     * (1) explicit declaration via {@link #declareTopic(String, int)} wins; (2) co-partition group
+     * inheritance from a declared peer; (3) max partition count across the producing
+     * sub-topology's source topics; iterate to a fixed point because chains of internal topics can
+     * depend on each other. Topics still unresolved fall back to 1 partition with a warning.
+     */
+    private void resolveInternalRepartitionTopicPartitions() {
+        final Set<String> internalTopics = collectInternalRepartitionTopics();
+
+        boolean changed = true;
+        while (changed) {
+            changed = false;
+            for (final String topic : internalTopics) {
+                if (tryResolveOneInternalTopic(topic)) {
+                    changed = true;
+                }
+            }
+        }
+
+        // Fallback for anything still unresolved.
+        for (final String topic : internalTopics) {
+            if (!declaredPartitionsByTopic.containsKey(topic)) {
+                log.warn("Could not resolve partition count for internal repartition topic '{}'; defaulting to 1. "
+                    + "Declare it explicitly via declareTopic() if a different count is needed.", topic);
+                declaredPartitionsByTopic.put(topic, 1);
+            }
+        }
+    }
+
+    private Set<String> collectInternalRepartitionTopics() {
+        final Set<String> internalTopics = new HashSet<>();
+        final Map<Integer, Set<String>> byId = internalTopologyBuilder.subtopologyToRepartitionTopics();
+        for (final int sid : subtopologyIds) {
+            internalTopics.addAll(byId.getOrDefault(sid, Collections.emptySet()));
+        }
+        return internalTopics;
+    }
+
+    /**
+     * Try to resolve a single internal repartition topic's partition count this round. Returns
+     * {@code true} if progress was made (the topic now has a count); {@code false} if it cannot be
+     * resolved yet (caller will iterate to a fixed point) or is already resolved.
+     */
+    private boolean tryResolveOneInternalTopic(final String topic) {
+        if (declaredPartitionsByTopic.containsKey(topic)) {
+            return false;
+        }
+        final Integer fromCopartition = resolveFromCopartitionGroup(topic);
+        if (fromCopartition != null) {
+            declaredPartitionsByTopic.put(topic, fromCopartition);
+            return true;
+        }
+        return tryResolveFromUpstreamSubtopology(topic);
+    }
+
+    private boolean tryResolveFromUpstreamSubtopology(final String topic) {
+        final Integer producerSid = internalTopologyBuilder.subtopologyForRepartitionTopicProducer(topic);
+        if (producerSid == null) {
+            return false;
+        }
+        final ProcessorTopology pt = subtopologyTopologies.get(producerSid);
+        if (pt == null) {
+            return false;
+        }
+        Integer max = null;
+        for (final String src : pt.sourceTopics()) {
+            final Integer n = declaredPartitionsByTopic.get(src);
+            if (n == null) {
+                return false;
+            }
+            if (max == null || n > max) {
+                max = n;
+            }
+        }
+        if (max == null) {
+            return false;
+        }
+        declaredPartitionsByTopic.put(topic, max);
+        return true;
+    }
+
+    /**
+     * If {@code topic} participates in a co-partition group with any topic that already has a declared
+     * count, return that count. Returns {@code null} if the topic is unconstrained by co-partitioning.
+     */
+    private Integer resolveFromCopartitionGroup(final String topic) {
+        for (final Set<String> group : internalTopologyBuilder.copartitionGroups()) {
+            if (!group.contains(topic)) {
+                continue;
+            }
+            for (final String peer : group) {
+                if (peer.equals(topic)) {
+                    continue;
+                }
+                final Integer n = declaredPartitionsByTopic.get(peer);
+                if (n != null) {
+                    return n;
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Validate that all topics in each co-partition group share the same declared partition count.
+     * Throws {@link TopologyException} naming the two witnessing topics on conflict.
+     */
+    private void validateCopartitioning() {
+        for (final Set<String> group : internalTopologyBuilder.copartitionGroups()) {
+            Integer expected = null;
+            String witness = null;
+            for (final String topic : group) {
+                final Integer n = declaredPartitionsByTopic.get(topic);
+                if (n == null) {
+                    continue;
+                }
+                if (expected == null) {
+                    expected = n;
+                    witness = topic;
+                } else if (!expected.equals(n)) {
+                    throw new TopologyException(
+                        "Co-partitioned topics have mismatching partition counts: '" + witness + "' has "
+                            + expected + " but '" + topic + "' has " + n
+                            + ". Declare matching counts via declareTopic() before piping records.");
+                }
+            }
+        }
     }
 
     /**

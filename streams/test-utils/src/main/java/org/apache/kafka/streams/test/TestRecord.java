@@ -37,6 +37,7 @@ public class TestRecord<K, V> {
     private final K key;
     private final V value;
     private final Instant recordTime;
+    private final Integer partition;
 
     /**
      * Creates a record.
@@ -47,10 +48,24 @@ public class TestRecord<K, V> {
      * @param recordTime The timestamp of the record.
      */
     public TestRecord(final K key, final V value, final Headers headers, final Instant recordTime) {
+        this(key, value, headers, recordTime, null);
+    }
+
+    /**
+     * Creates a record with an explicit target partition (KIP-1238).
+     *
+     * @param key The key that will be included in the record
+     * @param value The value of the record
+     * @param headers the record headers that will be included in the record
+     * @param recordTime The timestamp of the record.
+     * @param partition The target partition for this record, or {@code null} to let the driver route by key hash.
+     */
+    public TestRecord(final K key, final V value, final Headers headers, final Instant recordTime, final Integer partition) {
         this.key = key;
         this.value = value;
         this.recordTime = recordTime;
         this.headers = new RecordHeaders(headers);
+        this.partition = partition;
     }
 
     /**
@@ -62,6 +77,19 @@ public class TestRecord<K, V> {
      * @param timestampMs The timestamp of the record, in milliseconds since the beginning of the epoch.
      */
     public TestRecord(final K key, final V value, final Headers headers, final Long timestampMs) {
+        this(key, value, headers, timestampMs, null);
+    }
+
+    /**
+     * Creates a record with an explicit target partition (KIP-1238).
+     *
+     * @param key The key that will be included in the record
+     * @param value The value of the record
+     * @param headers the record headers that will be included in the record
+     * @param timestampMs The timestamp of the record, in milliseconds since the beginning of the epoch.
+     * @param partition The target partition for this record, or {@code null} to let the driver route by key hash.
+     */
+    public TestRecord(final K key, final V value, final Headers headers, final Long timestampMs, final Integer partition) {
         if (timestampMs != null) {
             if (timestampMs < 0) {
                 throw new IllegalArgumentException(
@@ -74,6 +102,7 @@ public class TestRecord<K, V> {
         this.key = key;
         this.value = value;
         this.headers = new RecordHeaders(headers);
+        this.partition = partition;
     }
 
     /**
@@ -99,8 +128,9 @@ public class TestRecord<K, V> {
         this.value = value;
         this.headers = new RecordHeaders(headers);
         this.recordTime = null;
+        this.partition = null;
     }
-    
+
     /**
      * Creates a record.
      *
@@ -112,6 +142,7 @@ public class TestRecord<K, V> {
         this.value = value;
         this.headers = new RecordHeaders();
         this.recordTime = null;
+        this.partition = null;
     }
 
     /**
@@ -134,6 +165,7 @@ public class TestRecord<K, V> {
         this.value = record.value();
         this.headers = record.headers();
         this.recordTime = Instant.ofEpochMilli(record.timestamp());
+        this.partition = null;
     }
 
     /**
@@ -147,6 +179,7 @@ public class TestRecord<K, V> {
         this.value = record.value();
         this.headers = record.headers();
         this.recordTime = Instant.ofEpochMilli(record.timestamp());
+        this.partition = null;
     }
 
     /**
@@ -205,14 +238,24 @@ public class TestRecord<K, V> {
         return recordTime;
     }
 
+    /**
+     * @return The explicit target partition, or {@code null} if the record should be routed by key hash (KIP-1238).
+     */
+    public Integer partition() {
+        return partition;
+    }
+
     @Override
     public String toString() {
-        return new StringJoiner(", ", TestRecord.class.getSimpleName() + "[", "]")
+        final StringJoiner joiner = new StringJoiner(", ", TestRecord.class.getSimpleName() + "[", "]")
                 .add("key=" + key)
                 .add("value=" + value)
                 .add("headers=" + headers)
-                .add("recordTime=" + recordTime)
-                .toString();
+                .add("recordTime=" + recordTime);
+        if (partition != null) {
+            joiner.add("partition=" + partition);
+        }
+        return joiner.toString();
     }
 
     @Override
@@ -227,11 +270,12 @@ public class TestRecord<K, V> {
         return Objects.equals(headers, that.headers) &&
             Objects.equals(key, that.key) &&
             Objects.equals(value, that.value) &&
-            Objects.equals(recordTime, that.recordTime);
+            Objects.equals(recordTime, that.recordTime) &&
+            Objects.equals(partition, that.partition);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(headers, key, value, recordTime);
+        return Objects.hash(headers, key, value, recordTime, partition);
     }
 }

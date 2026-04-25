@@ -1273,6 +1273,36 @@ public class InternalTopologyBuilder {
         return Collections.unmodifiableMap(topicGroups);
     }
 
+    /**
+     * Visible for KIP-1238 multi-partition {@code TopologyTestDriver}. Not part of the public API.
+     *
+     * @return a mapping from sub-topology id to the set of repartition source topic names
+     *         declared by that sub-topology (the keys of {@link TopicsInfo#repartitionSourceTopics}).
+     */
+    public synchronized Map<Integer, Set<String>> subtopologyToRepartitionTopics() {
+        final Map<Integer, Set<String>> result = new LinkedHashMap<>();
+        for (final Map.Entry<Subtopology, TopicsInfo> entry : subtopologyToTopicsInfo().entrySet()) {
+            result.put(entry.getKey().nodeGroupId, new HashSet<>(entry.getValue().repartitionSourceTopics.keySet()));
+        }
+        return Collections.unmodifiableMap(result);
+    }
+
+    /**
+     * Visible for KIP-1238 multi-partition {@code TopologyTestDriver}. Not part of the public API.
+     *
+     * @param topic the topic name to look up.
+     * @return the sub-topology id whose sink writes to {@code topic}, or {@code null} if no
+     *         sub-topology has this topic among its sinks.
+     */
+    public synchronized Integer subtopologyForRepartitionTopicProducer(final String topic) {
+        for (final Map.Entry<Subtopology, TopicsInfo> entry : subtopologyToTopicsInfo().entrySet()) {
+            if (entry.getValue().sinkTopics.contains(topic)) {
+                return entry.getKey().nodeGroupId;
+            }
+        }
+        return null;
+    }
+
     public Map<String, List<String>> nodeToSourceTopics() {
         return Collections.unmodifiableMap(nodeToSourceTopics);
     }
