@@ -371,7 +371,17 @@ public class TopologyTestDriver implements Closeable {
         producer = new MockProducer<>(Cluster.empty(), true, null, bytesSerializer, bytesSerializer) {
             @Override
             public List<PartitionInfo> partitionsFor(final String topic) {
-                return Collections.singletonList(new PartitionInfo(topic, PARTITION_ID, null, null, null));
+                // KIP-1238: when topics are declared with > 1 partition, the sink-side partitioner
+                // (DefaultStreamPartitioner) must see them all to compute the right output partition.
+                final int n = Math.max(1, declaredPartitionsByTopic.getOrDefault(topic, 1));
+                if (n == 1) {
+                    return Collections.singletonList(new PartitionInfo(topic, PARTITION_ID, null, null, null));
+                }
+                final List<PartitionInfo> infos = new ArrayList<>(n);
+                for (int p = 0; p < n; p++) {
+                    infos.add(new PartitionInfo(topic, p, null, null, null));
+                }
+                return infos;
             }
         };
 
@@ -580,6 +590,12 @@ public class TopologyTestDriver implements Closeable {
                             final byte[] value,
                             final Headers headers,
                             final Integer explicitPartition) {
+        // Lazy auto-init: any user declareTopic() / createInputTopic(..., partitions) /
+        // createOutputTopic(..., partitions) call seeded declaredPartitionsByTopic; flip the driver
+        // over to the multi-sub-topology execution path on the first record.
+        if (!initialized && !declaredPartitionsByTopic.isEmpty()) {
+            init();
+        }
         if (initialized) {
             pipeRecordMultiSub(topicName, timestamp, key, value, headers, explicitPartition);
             return;
@@ -937,14 +953,24 @@ public class TopologyTestDriver implements Closeable {
         }
 
         // 1. Enumerate sub-topology IDs and build each ProcessorTopology individually.
-        subtopologyIds.addAll(internalTopologyBuilder.subtopologyToRepartitionTopics().keySet());
+        final Map<Integer, Set<String>> repartByPid = internalTopologyBuilder.subtopologyToRepartitionTopics();
+        final Set<String> allInternalRepartitionTopics = new HashSet<>();
+        for (final Set<String> ts : repartByPid.values()) {
+            allInternalRepartitionTopics.addAll(ts);
+        }
+        subtopologyIds.addAll(repartByPid.keySet());
         Collections.sort(subtopologyIds);
         for (final int sid : subtopologyIds) {
             final ProcessorTopology pt = internalTopologyBuilder.buildSubtopology(sid);
             subtopologyTopologies.put(sid, pt);
             for (final String src : pt.sourceTopics()) {
                 subtopologyByInputTopic.put(src, sid);
-                declaredPartitionsByTopic.putIfAbsent(src, 1);
+                // Only default user-declared topics to 1 partition. Internal repartition topics get
+                // their count from resolveInternalRepartitionTopicPartitions(); pre-defaulting them to
+                // 1 here would short-circuit that resolution (containsKey early-return).
+                if (!allInternalRepartitionTopics.contains(src)) {
+                    declaredPartitionsByTopic.putIfAbsent(src, 1);
+                }
             }
         }
 
@@ -998,7 +1024,11 @@ public class TopologyTestDriver implements Closeable {
             }
 
             for (int p = 0; p < numPartitions; p++) {
-                buildOneMultiSubTask(sid, p, pt, sharedConsumer, threadId);
+                // Build a fresh ProcessorTopology per task: ProcessorNode state (sources, processors,
+                // store handles) is single-init and would otherwise throw "The processor is not closed"
+                // when the second task tries to initialize the same instance.
+                final ProcessorTopology freshPt = internalTopologyBuilder.buildSubtopology(sid);
+                buildOneMultiSubTask(sid, p, freshPt, sharedConsumer, threadId);
             }
         }
 
@@ -1343,17 +1373,24 @@ public class TopologyTestDriver implements Closeable {
         for (final ProducerRecord<byte[], byte[]> record : output) {
             final String topic = record.topic();
             final Integer producedPartition = record.partition();
-            final int capturedPartition = producedPartition == null ? 0 : producedPartition;
+            // MockProducer leaves partition() null when the upstream code did not pin one. Resolve it
+            // ourselves so the output record reflects the partition the test driver actually routes to.
+            final int capturedPartition = producedPartition != null
+                ? producedPartition
+                : resolvePartition(topic, record.key(), null);
+            final ProducerRecord<byte[], byte[]> stamped = producedPartition != null
+                ? record
+                : new ProducerRecord<>(topic, capturedPartition, record.timestamp(),
+                    record.key(), record.value(), record.headers());
 
-            outputRecordsByTopic.computeIfAbsent(topic, k -> new LinkedList<>()).add(record);
+            outputRecordsByTopic.computeIfAbsent(topic, k -> new LinkedList<>()).add(stamped);
             outputByTopicPartition
                 .computeIfAbsent(topic, k -> new HashMap<>())
                 .computeIfAbsent(capturedPartition, k -> new LinkedList<>())
-                .add(record);
+                .add(stamped);
 
             if (subtopologyByInputTopic.containsKey(topic)) {
-                final int target = resolvePartition(topic, record.key(), producedPartition);
-                enqueueTaskRecordMultiSub(topic, new TopicPartition(topic, target),
+                enqueueTaskRecordMultiSub(topic, new TopicPartition(topic, capturedPartition),
                     record.timestamp(), record.key(), record.value(), record.headers());
             }
             if (globalPartitionsByInputTopic.containsKey(topic)) {
