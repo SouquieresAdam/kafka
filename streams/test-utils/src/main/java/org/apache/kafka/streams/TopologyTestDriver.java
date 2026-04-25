@@ -41,6 +41,7 @@ import org.apache.kafka.common.serialization.Deserializer;
 import org.apache.kafka.common.serialization.Serializer;
 import org.apache.kafka.common.utils.LogContext;
 import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.Utils;
 import org.apache.kafka.streams.TopologyConfig.TaskConfig;
 import org.apache.kafka.streams.errors.LogAndContinueExceptionHandler;
 import org.apache.kafka.streams.errors.ProcessingExceptionHandler;
@@ -570,6 +571,20 @@ public class TopologyTestDriver implements Closeable {
                             final byte[] key,
                             final byte[] value,
                             final Headers headers) {
+        pipeRecord(topicName, timestamp, key, value, headers, null);
+    }
+
+    private void pipeRecord(final String topicName,
+                            final long timestamp,
+                            final byte[] key,
+                            final byte[] value,
+                            final Headers headers,
+                            final Integer explicitPartition) {
+        if (initialized) {
+            pipeRecordMultiSub(topicName, timestamp, key, value, headers, explicitPartition);
+            return;
+        }
+
         final TopicPartition inputTopicOrPatternPartition = getInputTopicOrPatternPartition(topicName);
         final TopicPartition globalInputTopicPartition = globalPartitionsByInputTopic.get(topicName);
 
@@ -743,6 +758,15 @@ public class TopologyTestDriver implements Closeable {
     public void advanceWallClockTime(final Duration advance) {
         Objects.requireNonNull(advance, "advance cannot be null");
         mockWallClockTime.sleep(advance.toMillis());
+        if (initialized) {
+            for (final StreamTask t : multiSubTasks.values()) {
+                t.maybePunctuateSystemTime();
+                commit(t.prepareCommit());
+                t.postCommit(true);
+            }
+            completeAllProcessableWorkMultiSub();
+            return;
+        }
         if (task != null) {
             task.maybePunctuateSystemTime();
             commit(task.prepareCommit(true));
@@ -1189,6 +1213,157 @@ public class TopologyTestDriver implements Closeable {
     }
 
     /**
+     * Resolve the partition a record routes to (KIP-1238).
+     * Explicit partition wins; otherwise {@code Utils.toPositive(Utils.murmur2(keyBytes)) % n} matches
+     * {@code BuiltInPartitioner.partitionForKey}; null key or n == 1 routes to partition 0.
+     */
+    private int resolvePartition(final String topic, final byte[] keyBytes, final Integer explicit) {
+        final int n = Math.max(1, declaredPartitionsByTopic.getOrDefault(topic, 1));
+        if (explicit != null) {
+            if (explicit < 0 || explicit >= n) {
+                throw new IllegalArgumentException(
+                    "Partition " + explicit + " is out of range for topic '" + topic
+                        + "' (has " + n + " partitions). Declare a higher count via declareTopic() if needed.");
+            }
+            return explicit;
+        }
+        if (keyBytes == null || n == 1) {
+            return 0;
+        }
+        return Utils.toPositive(Utils.murmur2(keyBytes)) % n;
+    }
+
+    /**
+     * Multi-sub-topology pipe path (KIP-1238). Routes the record to the task owning the resolved
+     * (topic, partition) and drains every task to quiescence before returning.
+     */
+    private void pipeRecordMultiSub(final String topicName,
+                                    final long timestamp,
+                                    final byte[] key,
+                                    final byte[] value,
+                                    final Headers headers,
+                                    final Integer explicitPartition) {
+        final boolean isTaskInput = subtopologyByInputTopic.containsKey(topicName);
+        final boolean isGlobal = globalPartitionsByInputTopic.containsKey(topicName);
+        if (!isTaskInput && !isGlobal) {
+            throw new IllegalArgumentException("Unknown topic: " + topicName);
+        }
+        if (isTaskInput) {
+            final int partition = resolvePartition(topicName, key, explicitPartition);
+            enqueueTaskRecordMultiSub(topicName, new TopicPartition(topicName, partition),
+                timestamp, key, value, headers);
+            completeAllProcessableWorkMultiSub();
+        }
+        if (isGlobal) {
+            processGlobalRecord(globalPartitionsByInputTopic.get(topicName), timestamp, key, value, headers);
+        }
+    }
+
+    private void enqueueTaskRecordMultiSub(final String topic,
+                                           final TopicPartition tp,
+                                           final long timestamp,
+                                           final byte[] key,
+                                           final byte[] value,
+                                           final Headers headers) {
+        final TaskId taskId = taskByTopicPartition.get(tp);
+        if (taskId == null) {
+            throw new IllegalStateException(
+                "No task owns " + tp + ". This typically means init() was not called or the topic "
+                    + "was not declared with enough partitions.");
+        }
+        final StreamTask owner = multiSubTasks.get(taskId);
+        if (owner == null) {
+            throw new IllegalStateException("Task " + taskId + " is registered but no StreamTask exists for it.");
+        }
+        final long offset = offsetsByTopicOrPatternPartition
+            .computeIfAbsent(tp, k -> new AtomicLong())
+            .getAndIncrement();
+        owner.addRecords(tp, Collections.singleton(new ConsumerRecord<>(
+            topic, tp.partition(), offset, timestamp, TimestampType.CREATE_TIME,
+            key == null ? ConsumerRecord.NULL_SIZE : key.length,
+            value == null ? ConsumerRecord.NULL_SIZE : value.length,
+            key, value, headers, Optional.empty())));
+    }
+
+    /**
+     * Drain every multi-sub-topology task to quiescence, picking the processable task with the lowest
+     * current stream time on each iteration to mirror {@code PartitionGroup} ordering across tasks.
+     */
+    private void completeAllProcessableWorkMultiSub() {
+        captureOutputsMultiSub();
+        if (multiSubTasks.isEmpty()) {
+            return;
+        }
+        StreamTask next;
+        while ((next = pickNextProcessableTask()) != null) {
+            next.resumePollingForPartitionsWithAvailableSpace();
+            next.updateLags();
+            next.process(mockWallClockTime.milliseconds());
+            next.maybePunctuateStreamTime();
+            commit(next.prepareCommit());
+            next.postCommit(true);
+            captureOutputsMultiSub();
+        }
+        for (final StreamTask t : multiSubTasks.values()) {
+            if (t.hasRecordsQueued()) {
+                log.info("Multi-sub task {} has records that cannot be processed right now; advance "
+                    + "wall-clock time or pipe records on co-partitioned topics (see {}).",
+                    t.id(), StreamsConfig.MAX_TASK_IDLE_MS_CONFIG);
+            }
+        }
+    }
+
+    private StreamTask pickNextProcessableTask() {
+        StreamTask best = null;
+        long bestTime = Long.MAX_VALUE;
+        final long now = mockWallClockTime.milliseconds();
+        for (final StreamTask t : multiSubTasks.values()) {
+            if (!t.hasRecordsQueued() || !t.isProcessable(now)) {
+                continue;
+            }
+            final long streamTime = ((ProcessorContextImpl) t.processorContext()).currentStreamTimeMs();
+            if (streamTime < bestTime) {
+                bestTime = streamTime;
+                best = t;
+            }
+        }
+        return best;
+    }
+
+    /**
+     * Capture all records emitted by the shared producer this round, partition them in
+     * {@link #outputByTopicPartition} and {@link #outputRecordsByTopic} (the latter for back-compat
+     * with the existing read accessors), and loop back into any sub-topology that consumes the topic.
+     * Honours an explicit producer partition when set (custom {@link org.apache.kafka.streams.processor.StreamPartitioner}
+     * on a sink); otherwise resolves by key.
+     */
+    private void captureOutputsMultiSub() {
+        final List<ProducerRecord<byte[], byte[]>> output = producer.history();
+        producer.clear();
+        for (final ProducerRecord<byte[], byte[]> record : output) {
+            final String topic = record.topic();
+            final Integer producedPartition = record.partition();
+            final int capturedPartition = producedPartition == null ? 0 : producedPartition;
+
+            outputRecordsByTopic.computeIfAbsent(topic, k -> new LinkedList<>()).add(record);
+            outputByTopicPartition
+                .computeIfAbsent(topic, k -> new HashMap<>())
+                .computeIfAbsent(capturedPartition, k -> new LinkedList<>())
+                .add(record);
+
+            if (subtopologyByInputTopic.containsKey(topic)) {
+                final int target = resolvePartition(topic, record.key(), producedPartition);
+                enqueueTaskRecordMultiSub(topic, new TopicPartition(topic, target),
+                    record.timestamp(), record.key(), record.value(), record.headers());
+            }
+            if (globalPartitionsByInputTopic.containsKey(topic)) {
+                processGlobalRecord(globalPartitionsByInputTopic.get(topic),
+                    record.timestamp(), record.key(), record.value(), record.headers());
+            }
+        }
+    }
+
+    /**
      * Get all the names of all the topics to which records have been produced during the test run.
      * <p>
      * Call this method after piping the input into the test driver to retrieve the full set of topic names the topology
@@ -1243,7 +1418,7 @@ public class TopologyTestDriver implements Closeable {
             throw new IllegalStateException("Provided `TestRecord` does not have a timestamp and no timestamp overwrite was provided via `time` parameter.");
         }
 
-        pipeRecord(topic, timestamp, serializedKey, serializedValue, record.headers());
+        pipeRecord(topic, timestamp, serializedKey, serializedValue, record.headers(), record.partition());
     }
 
     final long queueSize(final String topic) {
@@ -1678,6 +1853,16 @@ public class TopologyTestDriver implements Closeable {
             task.postCommit(true);
             task.closeClean();
         }
+        for (final StreamTask t : multiSubTasks.values()) {
+            try {
+                t.suspend();
+                t.prepareCommit();
+                t.postCommit(true);
+                t.closeClean();
+            } catch (final RuntimeException e) {
+                log.warn("Error closing multi-sub task {}: {}", t.id(), e.toString());
+            }
+        }
         if (globalStateTask != null) {
             try {
                 globalStateTask.close(false);
@@ -1685,7 +1870,11 @@ public class TopologyTestDriver implements Closeable {
                 // ignore
             }
         }
-        completeAllProcessableWork();
+        if (initialized) {
+            completeAllProcessableWorkMultiSub();
+        } else {
+            completeAllProcessableWork();
+        }
         if (task != null && task.hasRecordsQueued()) {
             log.warn("Found some records that cannot be processed due to the" +
                          " {} configuration during TopologyTestDriver#close().",
