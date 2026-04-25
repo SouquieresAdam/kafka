@@ -1499,6 +1499,9 @@ public class TopologyTestDriver implements Closeable {
 
     private StateStore getStateStore(final String name,
                                      final boolean throwForBuiltInStores) {
+        if (initialized) {
+            return getStateStoreMultiSub(name, throwForBuiltInStores);
+        }
         if (task != null) {
             task.processorContext().setRecordContext(new ProcessorRecordContext(0L, -1L, -1, null, new RecordHeaders()));
             final StateStore stateStore = ((ProcessorContextImpl) task.processorContext()).stateManager().store(name);
@@ -1522,6 +1525,157 @@ public class TopologyTestDriver implements Closeable {
         }
 
         return null;
+    }
+
+    /**
+     * Multi-sub-topology lookup (KIP-1238). A global store match wins; otherwise we scan the tasks
+     * that own this store and return the only one. If the store is hosted by more than one task,
+     * throw {@link IllegalStateException} pointing at the partition-aware overloads.
+     */
+    private StateStore getStateStoreMultiSub(final String name, final boolean throwForBuiltInStores) {
+        if (globalStateManager != null) {
+            final StateStore gs = globalStateManager.store(name);
+            if (gs != null) {
+                if (throwForBuiltInStores) {
+                    throwIfBuiltInStore(gs);
+                }
+                return gs;
+            }
+        }
+        final List<StreamTask> owning = tasksOwningStore(name);
+        if (owning.isEmpty()) {
+            return null;
+        }
+        if (owning.size() > 1) {
+            throw new IllegalStateException(
+                "Store '" + name + "' is partitioned across " + owning.size() + " tasks; "
+                    + "use getStateStore(name, partition) or getStateStore(name, subtopologyId, partition) to disambiguate.");
+        }
+        final StreamTask only = owning.get(0);
+        only.processorContext().setRecordContext(
+            new ProcessorRecordContext(0L, -1L, -1, null, new RecordHeaders()));
+        final StateStore stateStore = ((ProcessorContextImpl) only.processorContext()).stateManager().store(name);
+        if (throwForBuiltInStores && stateStore != null) {
+            throwIfBuiltInStore(stateStore);
+        }
+        return stateStore;
+    }
+
+    private List<StreamTask> tasksOwningStore(final String name) {
+        final List<StreamTask> out = new ArrayList<>();
+        for (final StreamTask t : multiSubTasks.values()) {
+            final StateStore s = ((ProcessorContextImpl) t.processorContext()).stateManager().store(name);
+            if (s != null) {
+                out.add(t);
+            }
+        }
+        return out;
+    }
+
+    private Integer subtopologyOwningStore(final String name) {
+        Integer found = null;
+        for (final StreamTask t : multiSubTasks.values()) {
+            final StateStore s = ((ProcessorContextImpl) t.processorContext()).stateManager().store(name);
+            if (s == null) {
+                continue;
+            }
+            final int sid = t.id().subtopology();
+            if (found != null && found != sid) {
+                throw new IllegalStateException(
+                    "Store '" + name + "' is registered in more than one sub-topology ("
+                        + found + " and " + sid + "). Use getStateStore(name, subtopologyId, partition) "
+                        + "to disambiguate.");
+            }
+            found = sid;
+        }
+        return found;
+    }
+
+    /**
+     * Return the {@link StateStore} for the task owning {@code partition} of the sub-topology that
+     * registers a store named {@code name} (KIP-1238). If the store name appears in multiple
+     * sub-topologies, throws {@link IllegalStateException}; use the 3-arg overload to disambiguate.
+     *
+     * @param name the store name
+     * @param partition the partition whose owning task should be queried
+     * @return the {@link StateStore}, or {@code null} if no sub-topology registers a store with this name
+     */
+    public StateStore getStateStore(final String name, final int partition) {
+        if (!initialized) {
+            init();
+        }
+        if (globalStateManager != null) {
+            final StateStore gs = globalStateManager.store(name);
+            if (gs != null) {
+                return gs;
+            }
+        }
+        final Integer sid = subtopologyOwningStore(name);
+        if (sid == null) {
+            return null;
+        }
+        return getStateStore(name, sid, partition);
+    }
+
+    /**
+     * Fully-qualified {@link StateStore} accessor (KIP-1238). Use when a store name appears in more
+     * than one sub-topology.
+     *
+     * @param name the store name
+     * @param subtopologyId the sub-topology id
+     * @param partition the partition whose owning task should be queried
+     * @return the {@link StateStore}, or {@code null} if the task does not register a store with this name
+     * @throws IllegalArgumentException if no task exists for {@code (subtopologyId, partition)}
+     */
+    public StateStore getStateStore(final String name, final int subtopologyId, final int partition) {
+        if (!initialized) {
+            init();
+        }
+        final TaskId taskId = new TaskId(subtopologyId, partition);
+        final StreamTask owner = multiSubTasks.get(taskId);
+        if (owner == null) {
+            throw new IllegalArgumentException(
+                "No task exists for " + taskId + " (sub-topology " + subtopologyId + " has "
+                    + partitionsBySubtopology.getOrDefault(subtopologyId, 0) + " partition(s)).");
+        }
+        owner.processorContext().setRecordContext(
+            new ProcessorRecordContext(0L, -1L, -1, null, new RecordHeaders()));
+        return ((ProcessorContextImpl) owner.processorContext()).stateManager().store(name);
+    }
+
+    /**
+     * @return the number of partitions of the sub-topology that registers {@code storeName}, or 0
+     *         if no sub-topology registers it (or 1 for a global store) (KIP-1238).
+     */
+    public int partitionsOf(final String storeName) {
+        if (!initialized) {
+            init();
+        }
+        if (globalStateManager != null && globalStateManager.store(storeName) != null) {
+            return 1;
+        }
+        final Integer sid = subtopologyOwningStore(storeName);
+        return sid == null ? 0 : partitionsBySubtopology.getOrDefault(sid, 0);
+    }
+
+    /**
+     * @return the number of partitions of the given sub-topology, or 0 if the id is unknown (KIP-1238).
+     */
+    public int partitionsOfSubtopology(final int subtopologyId) {
+        if (!initialized) {
+            init();
+        }
+        return partitionsBySubtopology.getOrDefault(subtopologyId, 0);
+    }
+
+    /**
+     * @return an unmodifiable list of the sub-topology ids in this driver (KIP-1238).
+     */
+    public List<Integer> subtopologies() {
+        if (!initialized) {
+            init();
+        }
+        return Collections.unmodifiableList(subtopologyIds);
     }
 
     private void throwIfBuiltInStore(final StateStore stateStore) {
@@ -1841,6 +1995,68 @@ public class TopologyTestDriver implements Closeable {
     public <K, V> SessionStoreWithHeaders<K, V> getSessionStoreWithHeaders(final String name) {
         final StateStore store = getStateStore(name, false);
         return store instanceof SessionStoreWithHeaders ? (SessionStoreWithHeaders<K, V>) store : null;
+    }
+
+    /**
+     * Partition-aware {@link KeyValueStore} accessor (KIP-1238).
+     */
+    @SuppressWarnings("unchecked")
+    public <K, V> KeyValueStore<K, V> getKeyValueStore(final String name, final int partition) {
+        final StateStore store = getStateStore(name, partition);
+        if (store instanceof TimestampedKeyValueStore) {
+            log.info("Method #getTimestampedKeyValueStore() should be used to access a TimestampedKeyValueStore.");
+            return new KeyValueStoreFacade<>((TimestampedKeyValueStore<K, V>) store);
+        }
+        return store instanceof KeyValueStore ? (KeyValueStore<K, V>) store : null;
+    }
+
+    /**
+     * Partition-aware {@link TimestampedKeyValueStore} accessor (KIP-1238).
+     */
+    @SuppressWarnings("unchecked")
+    public <K, V> KeyValueStore<K, ValueAndTimestamp<V>> getTimestampedKeyValueStore(final String name, final int partition) {
+        final StateStore store = getStateStore(name, partition);
+        return store instanceof TimestampedKeyValueStore ? (TimestampedKeyValueStore<K, V>) store : null;
+    }
+
+    /**
+     * Partition-aware {@link VersionedKeyValueStore} accessor (KIP-1238).
+     */
+    @SuppressWarnings("unchecked")
+    public <K, V> VersionedKeyValueStore<K, V> getVersionedKeyValueStore(final String name, final int partition) {
+        final StateStore store = getStateStore(name, partition);
+        return store instanceof VersionedKeyValueStore ? (VersionedKeyValueStore<K, V>) store : null;
+    }
+
+    /**
+     * Partition-aware {@link WindowStore} accessor (KIP-1238).
+     */
+    @SuppressWarnings("unchecked")
+    public <K, V> WindowStore<K, V> getWindowStore(final String name, final int partition) {
+        final StateStore store = getStateStore(name, partition);
+        if (store instanceof TimestampedWindowStore) {
+            log.info("Method #getTimestampedWindowStore() should be used to access a TimestampedWindowStore.");
+            return new WindowStoreFacade<>((TimestampedWindowStore<K, V>) store);
+        }
+        return store instanceof WindowStore ? (WindowStore<K, V>) store : null;
+    }
+
+    /**
+     * Partition-aware {@link TimestampedWindowStore} accessor (KIP-1238).
+     */
+    @SuppressWarnings("unchecked")
+    public <K, V> WindowStore<K, ValueAndTimestamp<V>> getTimestampedWindowStore(final String name, final int partition) {
+        final StateStore store = getStateStore(name, partition);
+        return store instanceof TimestampedWindowStore ? (TimestampedWindowStore<K, V>) store : null;
+    }
+
+    /**
+     * Partition-aware {@link SessionStore} accessor (KIP-1238).
+     */
+    @SuppressWarnings("unchecked")
+    public <K, V> SessionStore<K, V> getSessionStore(final String name, final int partition) {
+        final StateStore store = getStateStore(name, partition);
+        return store instanceof SessionStore ? (SessionStore<K, V>) store : null;
     }
 
     /**
