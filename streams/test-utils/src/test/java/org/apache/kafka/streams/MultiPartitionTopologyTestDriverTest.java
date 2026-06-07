@@ -336,6 +336,69 @@ public class MultiPartitionTopologyTestDriverTest {
         }
     }
 
+    // --- KIP-1238 TopologyTestDriverBuilder (Passe B) ---
+
+    @Test
+    public void builderProducesWorkingMultiPartitionDriver() {
+        // The builder is the KIP-1238 blessed entry point: build() declares topics and, when one has
+        // >1 partition, wires the multi-partition task graph. A key must land in the count store at the
+        // partition its murmur2 hash selects (no selectKey => store co-partitioned with the source).
+        final StreamsBuilder builder = new StreamsBuilder();
+        builder.stream(IN_TOPIC, Consumed.with(Serdes.String(), Serdes.String()))
+            .groupByKey(Grouped.with(Serdes.String(), Serdes.String()))
+            .count(Materialized.<String, Long>as(Stores.inMemoryKeyValueStore("counts"))
+                .withKeySerde(Serdes.String())
+                .withValueSerde(Serdes.Long()));
+
+        try (TopologyTestDriver driver = new TopologyTestDriverBuilder(builder.build())
+                .withConfig(baseProps())
+                .withInitialWallClockTime(Instant.ofEpochMilli(0L))
+                .declareTopic(IN_TOPIC, 4)
+                .build()) {
+            final int expected = BuiltInPartitioner.partitionForKey(STRING_SER.serialize(IN_TOPIC, "k"), 4);
+            driver.createInputTopic(IN_TOPIC, STRING_SER, STRING_SER).pipeInput("k", "v");
+            assertEquals(4, driver.partitionsOf("counts"));
+            assertEquals(Long.valueOf(1L), driver.getKeyValueStore("counts", expected).get("k"),
+                "key 'k' should be counted in the counts store at its hashed partition " + expected);
+        }
+    }
+
+    @Test
+    public void builderSinglePartitionStaysOnLegacyPath() {
+        // When no declared topic has >1 partition, build() leaves the driver on the legacy path, so the
+        // output record carries no routed partition (partition() == -1), mirroring the lazy-trigger rule.
+        try (TopologyTestDriver driver = new TopologyTestDriverBuilder(identityTopology())
+                .withConfig(baseProps())
+                .declareTopic(IN_TOPIC, 1)
+                .declareTopic(OUT_TOPIC, 1)
+                .build()) {
+            driver.createInputTopic(IN_TOPIC, STRING_SER, STRING_SER).pipeInput("k", "v");
+            final TestRecord<String, String> rec =
+                driver.createOutputTopic(OUT_TOPIC, STRING_DES, STRING_DES).readRecord();
+            assertEquals("v", rec.getValue());
+            assertEquals(-1, rec.partition());
+        }
+    }
+
+    @Test
+    public void builderRejectsInvalidPartitionCount() {
+        assertThrows(IllegalArgumentException.class,
+            () -> new TopologyTestDriverBuilder(identityTopology()).declareTopic(IN_TOPIC, 0));
+    }
+
+    @Test
+    public void builderRejectsRedeclareWithDifferentCount() {
+        assertThrows(IllegalArgumentException.class,
+            () -> new TopologyTestDriverBuilder(identityTopology())
+                .declareTopic(IN_TOPIC, 4)
+                .declareTopic(IN_TOPIC, 2));
+    }
+
+    @Test
+    public void builderRequiresTopology() {
+        assertThrows(NullPointerException.class, () -> new TopologyTestDriverBuilder(null));
+    }
+
     /**
      * Exercises four KIP-1238 concerns at once with a single topology:
      * <ul>
