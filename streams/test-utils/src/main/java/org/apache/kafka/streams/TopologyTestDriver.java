@@ -877,7 +877,7 @@ public class TopologyTestDriver implements Closeable {
      * @throws IllegalArgumentException if {@code partitions} is less than 1, or the topic was already
      *         declared with a different count
      */
-    public void declareTopic(final String topicName, final int partitions) {
+    void declareTopic(final String topicName, final int partitions) {
         Objects.requireNonNull(topicName, "topicName cannot be null");
         if (initialized) {
             throw new IllegalStateException(
@@ -908,7 +908,7 @@ public class TopologyTestDriver implements Closeable {
      * fallback to 1), validates co-partitioning, and computes the per-sub-topology partition count
      * as the max across its source topics.</p>
      */
-    public void init() {
+    void init() {
         if (initialized) {
             return;
         }
