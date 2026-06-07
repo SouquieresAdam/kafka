@@ -33,11 +33,17 @@ import java.util.StringJoiner;
  * {@link TestInputTopic} will auto advance it's time when the record is piped.
  */
 public class TestRecord<K, V> {
+    /**
+     * Sentinel returned by {@link #partition()} when no explicit partition was set on the record (KIP-1238).
+     * A record carrying this value is routed by the driver using the record key's hash.
+     */
+    private static final int NO_PARTITION = -1;
+
     private final Headers headers;
     private final K key;
     private final V value;
     private final Instant recordTime;
-    private final Integer partition;
+    private final int partition;
 
     /**
      * Creates a record.
@@ -48,7 +54,7 @@ public class TestRecord<K, V> {
      * @param recordTime The timestamp of the record.
      */
     public TestRecord(final K key, final V value, final Headers headers, final Instant recordTime) {
-        this(key, value, headers, recordTime, null);
+        this(key, value, headers, recordTime, NO_PARTITION);
     }
 
     /**
@@ -58,9 +64,9 @@ public class TestRecord<K, V> {
      * @param value The value of the record
      * @param headers the record headers that will be included in the record
      * @param recordTime The timestamp of the record.
-     * @param partition The target partition for this record, or {@code null} to let the driver route by key hash.
+     * @param partition The target partition for this record, or a negative value to let the driver route by key hash.
      */
-    public TestRecord(final K key, final V value, final Headers headers, final Instant recordTime, final Integer partition) {
+    public TestRecord(final K key, final V value, final Headers headers, final Instant recordTime, final int partition) {
         this.key = key;
         this.value = value;
         this.recordTime = recordTime;
@@ -70,26 +76,13 @@ public class TestRecord<K, V> {
 
     /**
      * Creates a record.
-     * 
+     *
      * @param key The key that will be included in the record
      * @param value The value of the record
      * @param headers the record headers that will be included in the record
      * @param timestampMs The timestamp of the record, in milliseconds since the beginning of the epoch.
      */
     public TestRecord(final K key, final V value, final Headers headers, final Long timestampMs) {
-        this(key, value, headers, timestampMs, null);
-    }
-
-    /**
-     * Creates a record with an explicit target partition (KIP-1238).
-     *
-     * @param key The key that will be included in the record
-     * @param value The value of the record
-     * @param headers the record headers that will be included in the record
-     * @param timestampMs The timestamp of the record, in milliseconds since the beginning of the epoch.
-     * @param partition The target partition for this record, or {@code null} to let the driver route by key hash.
-     */
-    public TestRecord(final K key, final V value, final Headers headers, final Long timestampMs, final Integer partition) {
         if (timestampMs != null) {
             if (timestampMs < 0) {
                 throw new IllegalArgumentException(
@@ -102,7 +95,7 @@ public class TestRecord<K, V> {
         this.key = key;
         this.value = value;
         this.headers = new RecordHeaders(headers);
-        this.partition = partition;
+        this.partition = NO_PARTITION;
     }
 
     /**
@@ -128,7 +121,7 @@ public class TestRecord<K, V> {
         this.value = value;
         this.headers = new RecordHeaders(headers);
         this.recordTime = null;
-        this.partition = null;
+        this.partition = NO_PARTITION;
     }
 
     /**
@@ -142,7 +135,7 @@ public class TestRecord<K, V> {
         this.value = value;
         this.headers = new RecordHeaders();
         this.recordTime = null;
-        this.partition = null;
+        this.partition = NO_PARTITION;
     }
 
     /**
@@ -165,7 +158,7 @@ public class TestRecord<K, V> {
         this.value = record.value();
         this.headers = record.headers();
         this.recordTime = Instant.ofEpochMilli(record.timestamp());
-        this.partition = null;
+        this.partition = NO_PARTITION;
     }
 
     /**
@@ -179,7 +172,7 @@ public class TestRecord<K, V> {
         this.value = record.value();
         this.headers = record.headers();
         this.recordTime = Instant.ofEpochMilli(record.timestamp());
-        this.partition = null;
+        this.partition = NO_PARTITION;
     }
 
     /**
@@ -239,9 +232,9 @@ public class TestRecord<K, V> {
     }
 
     /**
-     * @return The explicit target partition, or {@code null} if the record should be routed by key hash (KIP-1238).
+     * @return The explicit target partition, or {@code -1} if the record should be routed by key hash (KIP-1238).
      */
-    public Integer partition() {
+    public int partition() {
         return partition;
     }
 
@@ -252,7 +245,7 @@ public class TestRecord<K, V> {
                 .add("value=" + value)
                 .add("headers=" + headers)
                 .add("recordTime=" + recordTime);
-        if (partition != null) {
+        if (partition != NO_PARTITION) {
             joiner.add("partition=" + partition);
         }
         return joiner.toString();
@@ -267,11 +260,32 @@ public class TestRecord<K, V> {
             return false;
         }
         final TestRecord<?, ?> that = (TestRecord<?, ?>) o;
+        return partition == that.partition &&
+            Objects.equals(headers, that.headers) &&
+            Objects.equals(key, that.key) &&
+            Objects.equals(value, that.value) &&
+            Objects.equals(recordTime, that.recordTime);
+    }
+
+    /**
+     * Compares this record to another for equality on every field <em>except</em> the partition (KIP-1238).
+     * Useful when asserting on driver output where the routed partition is irrelevant to the test.
+     *
+     * @param o the object to compare with
+     * @return {@code true} if {@code o} is a {@code TestRecord} equal to this one ignoring the partition
+     */
+    public boolean equalsIgnorePartition(final Object o) {
+        if (this == o) {
+            return true;
+        }
+        if (o == null || getClass() != o.getClass()) {
+            return false;
+        }
+        final TestRecord<?, ?> that = (TestRecord<?, ?>) o;
         return Objects.equals(headers, that.headers) &&
             Objects.equals(key, that.key) &&
             Objects.equals(value, that.value) &&
-            Objects.equals(recordTime, that.recordTime) &&
-            Objects.equals(partition, that.partition);
+            Objects.equals(recordTime, that.recordTime);
     }
 
     @Override

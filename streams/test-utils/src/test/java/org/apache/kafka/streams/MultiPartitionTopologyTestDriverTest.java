@@ -16,6 +16,7 @@
  */
 package org.apache.kafka.streams;
 
+import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.clients.producer.internals.BuiltInPartitioner;
 import org.apache.kafka.common.serialization.LongDeserializer;
 import org.apache.kafka.common.serialization.Serdes;
@@ -39,6 +40,7 @@ import org.apache.kafka.streams.test.TestRecord;
 import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
+import java.time.Instant;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Properties;
@@ -104,7 +106,7 @@ public class MultiPartitionTopologyTestDriverTest {
 
             final TestInputTopic<String, String> in =
                 driver.createInputTopic(IN_TOPIC, STRING_SER, STRING_SER);
-            in.pipeInput(new TestRecord<>("anyKey", "v0", null, 0L, forcedPartition));
+            in.pipeInput(new TestRecord<>("anyKey", "v0", null, Instant.ofEpochMilli(0L), forcedPartition));
 
             assertEquals(4, driver.partitionsOf("counts"));
             final KeyValueStore<String, Long> forcedStore = driver.getKeyValueStore("counts", forcedPartition);
@@ -140,16 +142,22 @@ public class MultiPartitionTopologyTestDriverTest {
     }
 
     @Test
-    public void nullKeyRoutesToPartitionZero() {
+    public void nullKeyRoutesRoundRobin() {
+        // KIP-1238: null-key records carry no routable key, so the driver distributes them
+        // round-robin across the topic's partitions (0, 1, 2, 0, ...) rather than pinning them all to 0.
         try (TopologyTestDriver driver = new TopologyTestDriver(identityTopology(), baseProps())) {
             driver.createInputTopic(IN_TOPIC, STRING_SER, STRING_SER, 3);
             driver.createOutputTopic(OUT_TOPIC, STRING_DES, STRING_DES, 3);
             final TestInputTopic<String, String> in =
                 driver.createInputTopic(IN_TOPIC, STRING_SER, STRING_SER);
-            in.pipeInput(null, "v");
-            final org.apache.kafka.clients.producer.ProducerRecord<byte[], byte[]> got =
-                driver.readRecord(OUT_TOPIC);
-            assertEquals(Integer.valueOf(0), got.partition());
+            final int[] expected = {0, 1, 2, 0};
+            for (int i = 0; i < expected.length; i++) {
+                in.pipeInput(null, "v" + i);
+                final ProducerRecord<byte[], byte[]> got =
+                    driver.readRecord(OUT_TOPIC);
+                assertEquals(Integer.valueOf(expected[i]), got.partition(),
+                    "null-key record #" + i + " should round-robin to partition " + expected[i]);
+            }
         }
     }
 
@@ -274,6 +282,28 @@ public class MultiPartitionTopologyTestDriverTest {
     }
 
     @Test
+    public void withHeadersPartitionAwareAccessorsResolvePerPartition() {
+        // KIP-1238: the *WithHeaders partition-aware accessors resolve the partition-local store and,
+        // like their no-arg counterparts, return null when it is not a *WithHeaders store. Exercising
+        // partitions 0..2 of a partitioned plain count store proves the per-partition lookup path works.
+        final StreamsBuilder builder = new StreamsBuilder();
+        builder.stream(IN_TOPIC, Consumed.with(Serdes.String(), Serdes.String()))
+            .groupByKey(Grouped.with(Serdes.String(), Serdes.String()))
+            .count(Materialized.<String, Long>as(Stores.inMemoryKeyValueStore("counts"))
+                .withKeySerde(Serdes.String())
+                .withValueSerde(Serdes.Long()));
+
+        try (TopologyTestDriver driver = new TopologyTestDriver(builder.build(), baseProps())) {
+            driver.declareTopic(IN_TOPIC, 3);
+            driver.init();
+            assertEquals(3, driver.partitionsOf("counts"));
+            assertNull(driver.getTimestampedKeyValueStoreWithHeaders("counts", 0));
+            assertNull(driver.getTimestampedWindowStoreWithHeaders("counts", 1));
+            assertNull(driver.getSessionStoreWithHeaders("counts", 2));
+        }
+    }
+
+    @Test
     public void singlePartitionBackCompatPathWorksWithoutInit() {
         // No declareTopic, no init() → legacy single-flat-task path. Existing single-partition tests
         // should continue to function unchanged.
@@ -284,6 +314,25 @@ public class MultiPartitionTopologyTestDriverTest {
                 driver.createOutputTopic(OUT_TOPIC, STRING_DES, STRING_DES);
             in.pipeInput("k", "v");
             assertEquals("v", out.readValue());
+        }
+    }
+
+    @Test
+    public void singlePartitionDeclarationStaysOnLegacyPath() {
+        // KIP-1238: the driver only auto-switches to multi-partition mode when a declared topic has
+        // more than one partition. Declaring everything as single-partition keeps the legacy path,
+        // where output records carry no routed partition (partition() == -1).
+        try (TopologyTestDriver driver = new TopologyTestDriver(identityTopology(), baseProps())) {
+            driver.declareTopic(IN_TOPIC, 1);
+            driver.declareTopic(OUT_TOPIC, 1);
+            final TestInputTopic<String, String> in =
+                driver.createInputTopic(IN_TOPIC, STRING_SER, STRING_SER);
+            final TestOutputTopic<String, String> out =
+                driver.createOutputTopic(OUT_TOPIC, STRING_DES, STRING_DES);
+            in.pipeInput("k", "v");
+            final TestRecord<String, String> rec = out.readRecord();
+            assertEquals("v", rec.getValue());
+            assertEquals(-1, rec.partition());
         }
     }
 

@@ -34,8 +34,10 @@ import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.allOf;
 import static org.hamcrest.Matchers.hasProperty;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class TestRecordTest {
     private final String key = "testKey";
@@ -148,6 +150,67 @@ public class TestRecordTest {
                 + "headers=RecordHeaders(headers = [RecordHeader(key = foo, value = [118, 97, 108, 117, 101]), "
                 + "RecordHeader(key = bar, value = null), RecordHeader(key = \"A\\u00ea\\u00f1\\u00fcC\", value = [118, 97, 108, 117, 101])], isReadOnly = false), "
                 + "recordTime=2019-06-01T10:00:00Z]"));
+    }
+
+    @Test
+    public void testPartitionDefaultsToUnset() {
+        // KIP-1238: records built without an explicit partition default to the -1 sentinel,
+        // meaning "let the driver route by key hash".
+        assertEquals(-1, new TestRecord<>(key, value, headers, recordTime).partition());
+        assertEquals(-1, new TestRecord<>(key, value, headers, recordMs).partition());
+        assertEquals(-1, new TestRecord<>(key, value, headers).partition());
+        assertEquals(-1, new TestRecord<>(key, value).partition());
+        assertEquals(-1, new TestRecord<>(value).partition());
+    }
+
+    @Test
+    public void testExplicitPartitionConstructor() {
+        // KIP-1238: the (key, value, headers, recordTime, partition) constructor pins the partition.
+        final TestRecord<String, Integer> testRecord = new TestRecord<>(key, value, headers, recordTime, 3);
+        assertEquals(3, testRecord.partition());
+    }
+
+    @Test
+    public void testEqualsConsidersPartition() {
+        // KIP-1238: equals()/hashCode() take the partition into account.
+        final TestRecord<String, Integer> p0 = new TestRecord<>(key, value, headers, recordTime, 0);
+        final TestRecord<String, Integer> p1 = new TestRecord<>(key, value, headers, recordTime, 1);
+        assertNotEquals(p0, p1);
+
+        final TestRecord<String, Integer> p0again = new TestRecord<>(key, value, headers, recordTime, 0);
+        assertEquals(p0, p0again);
+        assertEquals(p0.hashCode(), p0again.hashCode());
+
+        // an unset (default) partition differs from an explicit one
+        assertNotEquals(new TestRecord<>(key, value, headers, recordTime), p0);
+    }
+
+    @Test
+    public void testEqualsIgnorePartition() {
+        // KIP-1238: equalsIgnorePartition() matches on every field except the partition.
+        final TestRecord<String, Integer> p0 = new TestRecord<>(key, value, headers, recordTime, 0);
+        final TestRecord<String, Integer> p1 = new TestRecord<>(key, value, headers, recordTime, 1);
+        assertNotEquals(p0, p1);
+        assertTrue(p0.equalsIgnorePartition(p1));
+        assertTrue(p1.equalsIgnorePartition(p0));
+
+        // a genuine field mismatch is still detected
+        assertFalse(p0.equalsIgnorePartition(new TestRecord<>("other", value, headers, recordTime, 0)));
+        assertFalse(p0.equalsIgnorePartition(new TestRecord<>(key, 2, headers, recordTime, 0)));
+
+        // reflexive / null / type guards
+        assertTrue(p0.equalsIgnorePartition(p0));
+        assertFalse(p0.equalsIgnorePartition(null));
+        assertFalse(p0.equalsIgnorePartition("not a record"));
+    }
+
+    @Test
+    public void testToStringIncludesPartitionWhenSet() {
+        final TestRecord<String, Integer> testRecord = new TestRecord<>(key, value, headers, recordTime, 2);
+        assertThat(testRecord.toString(), equalTo("TestRecord[key=testKey, value=1, "
+                + "headers=RecordHeaders(headers = [RecordHeader(key = foo, value = [118, 97, 108, 117, 101]), "
+                + "RecordHeader(key = bar, value = null), RecordHeader(key = \"A\\u00ea\\u00f1\\u00fcC\", value = [118, 97, 108, 117, 101])], isReadOnly = false), "
+                + "recordTime=2019-06-01T10:00:00Z, partition=2]"));
     }
 
     @Test

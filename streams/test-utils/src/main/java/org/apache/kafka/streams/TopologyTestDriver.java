@@ -258,6 +258,8 @@ public class TopologyTestDriver implements Closeable {
     // KIP-1238 multi-partition lifecycle (declareTopic/init). The fields below back the new API only;
     // the legacy single-partition execution path does not consult them and continues to work unchanged.
     private final Map<String, Integer> declaredPartitionsByTopic = new HashMap<>();
+    // KIP-1238: per-topic counter for round-robin routing of null-key records (no explicit partition).
+    private final Map<String, Integer> nullKeyRoundRobinByTopic = new HashMap<>();
     private boolean initialized = false;
     private final List<Integer> subtopologyIds = new ArrayList<>();
     private final Map<Integer, ProcessorTopology> subtopologyTopologies = new HashMap<>();
@@ -581,7 +583,7 @@ public class TopologyTestDriver implements Closeable {
                             final byte[] key,
                             final byte[] value,
                             final Headers headers) {
-        pipeRecord(topicName, timestamp, key, value, headers, null);
+        pipeRecord(topicName, timestamp, key, value, headers, -1);
     }
 
     private void pipeRecord(final String topicName,
@@ -589,11 +591,11 @@ public class TopologyTestDriver implements Closeable {
                             final byte[] key,
                             final byte[] value,
                             final Headers headers,
-                            final Integer explicitPartition) {
-        // Lazy auto-init: any user declareTopic() / createInputTopic(..., partitions) /
-        // createOutputTopic(..., partitions) call seeded declaredPartitionsByTopic; flip the driver
-        // over to the multi-sub-topology execution path on the first record.
-        if (!initialized && !declaredPartitionsByTopic.isEmpty()) {
+                            final int explicitPartition) {
+        // Lazy auto-init: switch to the multi-sub-topology execution path on the first record only when
+        // at least one declared topic has more than one partition (KIP-1238). Declaring topics with a
+        // single partition keeps the legacy single-flat-task path, preserving strict back-compat.
+        if (!initialized && declaredPartitionsByTopic.values().stream().anyMatch(count -> count > 1)) {
             init();
         }
         if (initialized) {
@@ -1253,18 +1255,24 @@ public class TopologyTestDriver implements Closeable {
      * Explicit partition wins; otherwise {@code Utils.toPositive(Utils.murmur2(keyBytes)) % n} matches
      * {@code BuiltInPartitioner.partitionForKey}; null key or n == 1 routes to partition 0.
      */
-    private int resolvePartition(final String topic, final byte[] keyBytes, final Integer explicit) {
+    private int resolvePartition(final String topic, final byte[] keyBytes, final int explicit) {
         final int n = Math.max(1, declaredPartitionsByTopic.getOrDefault(topic, 1));
-        if (explicit != null) {
-            if (explicit < 0 || explicit >= n) {
+        // A negative explicit partition is the "unset" sentinel (TestRecord default): route by key instead.
+        if (explicit >= 0) {
+            if (explicit >= n) {
                 throw new IllegalArgumentException(
                     "Partition " + explicit + " is out of range for topic '" + topic
                         + "' (has " + n + " partitions). Declare a higher count via declareTopic() if needed.");
             }
             return explicit;
         }
-        if (keyBytes == null || n == 1) {
+        if (n == 1) {
             return 0;
+        }
+        if (keyBytes == null) {
+            // KIP-1238: distribute null-key records round-robin across the topic's partitions.
+            final int count = nullKeyRoundRobinByTopic.merge(topic, 1, Integer::sum);
+            return (count - 1) % n;
         }
         return Utils.toPositive(Utils.murmur2(keyBytes)) % n;
     }
@@ -1278,7 +1286,7 @@ public class TopologyTestDriver implements Closeable {
                                     final byte[] key,
                                     final byte[] value,
                                     final Headers headers,
-                                    final Integer explicitPartition) {
+                                    final int explicitPartition) {
         final boolean isTaskInput = subtopologyByInputTopic.containsKey(topicName);
         final boolean isGlobal = globalPartitionsByInputTopic.containsKey(topicName);
         if (!isTaskInput && !isGlobal) {
@@ -1383,7 +1391,7 @@ public class TopologyTestDriver implements Closeable {
             // ourselves so the output record reflects the partition the test driver actually routes to.
             final int capturedPartition = producedPartition != null
                 ? producedPartition
-                : resolvePartition(topic, record.key(), null);
+                : resolvePartition(topic, record.key(), -1);
             final ProducerRecord<byte[], byte[]> stamped = producedPartition != null
                 ? record
                 : new ProducerRecord<>(topic, capturedPartition, record.timestamp(),
@@ -1446,8 +1454,10 @@ public class TopologyTestDriver implements Closeable {
         // the driver actually routed/stamped (see captureOutputsMultiSub). The legacy single-task
         // path keeps partition=null on the returned TestRecord to preserve byte-identical
         // behaviour for pre-KIP-1238 tests that compare full TestRecords by equals().
-        final Integer outputPartition = initialized ? record.partition() : null;
-        return new TestRecord<>(key, value, record.headers(), record.timestamp(), outputPartition);
+        final int outputPartition = initialized && record.partition() != null ? record.partition() : -1;
+        final Long ts = record.timestamp();
+        return new TestRecord<>(key, value, record.headers(),
+            ts == null ? null : Instant.ofEpochMilli(ts), outputPartition);
     }
 
     <K, V> void pipeRecord(final String topic,
@@ -2105,6 +2115,33 @@ public class TopologyTestDriver implements Closeable {
     public <K, V> SessionStore<K, V> getSessionStore(final String name, final int partition) {
         final StateStore store = getStateStore(name, partition);
         return store instanceof SessionStore ? (SessionStore<K, V>) store : null;
+    }
+
+    /**
+     * Partition-aware {@link TimestampedKeyValueStoreWithHeaders} accessor (KIP-1238).
+     */
+    @SuppressWarnings("unchecked")
+    public <K, V> KeyValueStore<K, ValueTimestampHeaders<V>> getTimestampedKeyValueStoreWithHeaders(final String name, final int partition) {
+        final StateStore store = getStateStore(name, partition);
+        return store instanceof TimestampedKeyValueStoreWithHeaders ? (TimestampedKeyValueStoreWithHeaders<K, V>) store : null;
+    }
+
+    /**
+     * Partition-aware {@link TimestampedWindowStoreWithHeaders} accessor (KIP-1238).
+     */
+    @SuppressWarnings("unchecked")
+    public <K, V> WindowStore<K, ValueTimestampHeaders<V>> getTimestampedWindowStoreWithHeaders(final String name, final int partition) {
+        final StateStore store = getStateStore(name, partition);
+        return store instanceof TimestampedWindowStoreWithHeaders ? (TimestampedWindowStoreWithHeaders<K, V>) store : null;
+    }
+
+    /**
+     * Partition-aware {@link SessionStoreWithHeaders} accessor (KIP-1238).
+     */
+    @SuppressWarnings("unchecked")
+    public <K, V> SessionStoreWithHeaders<K, V> getSessionStoreWithHeaders(final String name, final int partition) {
+        final StateStore store = getStateStore(name, partition);
+        return store instanceof SessionStoreWithHeaders ? (SessionStoreWithHeaders<K, V>) store : null;
     }
 
     /**
