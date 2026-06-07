@@ -23,7 +23,7 @@ import java.util.Objects;
 import java.util.Properties;
 
 /**
- * Fluent builder for a multi-partition {@link TopologyTestDriver} (KIP-1238).
+ * Fluent builder for a multi-partition {@link TopologyTestDriver}.
  *
  * <p>This is the entry point for testing topologies with topics that have more than one partition.
  * Declare the partition count of each relevant topic, then call {@link #build()}: when at least one
@@ -79,7 +79,7 @@ public class TopologyTestDriverBuilder {
     }
 
     /**
-     * Declare the number of partitions for an input, output, or internal repartition topic (KIP-1238).
+     * Declare the number of partitions for an input, output, or internal repartition topic.
      *
      * @param topicName  the topic to declare
      * @param partitions the number of partitions (must be at least 1)
@@ -104,7 +104,7 @@ public class TopologyTestDriverBuilder {
 
     /**
      * Build the driver: construct it, declare all topics, and—when at least one declared topic has more
-     * than one partition—create the multi-partition task graph (KIP-1238).
+     * than one partition—create the multi-partition task graph.
      *
      * @return a ready-to-use {@link TopologyTestDriver}
      */

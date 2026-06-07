@@ -255,10 +255,10 @@ public class TopologyTestDriver implements Closeable {
     private final Map<String, Queue<ProducerRecord<byte[], byte[]>>> outputRecordsByTopic = new HashMap<>();
     private final StreamsConfigUtils.ProcessingMode processingMode;
 
-    // KIP-1238 multi-partition lifecycle (declareTopic/init). The fields below back the new API only;
+    // Multi-partition lifecycle (declareTopic/init). The fields below back the new API only;
     // the legacy single-partition execution path does not consult them and continues to work unchanged.
     private final Map<String, Integer> declaredPartitionsByTopic = new HashMap<>();
-    // KIP-1238: per-topic counter for round-robin routing of null-key records (no explicit partition).
+    // Per-topic counter for round-robin routing of null-key records (no explicit partition).
     private final Map<String, Integer> nullKeyRoundRobinByTopic = new HashMap<>();
     private boolean initialized = false;
     private final List<Integer> subtopologyIds = new ArrayList<>();
@@ -373,7 +373,7 @@ public class TopologyTestDriver implements Closeable {
         producer = new MockProducer<>(Cluster.empty(), true, null, bytesSerializer, bytesSerializer) {
             @Override
             public List<PartitionInfo> partitionsFor(final String topic) {
-                // KIP-1238: when topics are declared with > 1 partition, the sink-side partitioner
+                // When topics are declared with > 1 partition, the sink-side partitioner
                 // (DefaultStreamPartitioner) must see them all to compute the right output partition.
                 final int n = Math.max(1, declaredPartitionsByTopic.getOrDefault(topic, 1));
                 if (n == 1) {
@@ -397,7 +397,7 @@ public class TopologyTestDriver implements Closeable {
         setupGlobalTask(mockWallClockTime, streamsConfig, streamsMetrics, cache);
         setupTask(streamsConfig, streamsMetrics, cache, internalTopologyBuilder.topologyConfigs().getTaskConfig());
 
-        // Capture references the multi-sub-topology runtime path (KIP-1238) needs at init() time.
+        // Capture references the multi-sub-topology runtime path needs at init() time.
         this.multiSubStreamsConfig = streamsConfig;
         this.multiSubTaskConfig = internalTopologyBuilder.topologyConfigs().getTaskConfig();
         this.multiSubStreamsMetrics = streamsMetrics;
@@ -593,7 +593,7 @@ public class TopologyTestDriver implements Closeable {
                             final Headers headers,
                             final int explicitPartition) {
         // Lazy auto-init: switch to the multi-sub-topology execution path on the first record only when
-        // at least one declared topic has more than one partition (KIP-1238). Declaring topics with a
+        // at least one declared topic has more than one partition. Declaring topics with a
         // single partition keeps the legacy single-flat-task path, preserving strict back-compat.
         if (!initialized && declaredPartitionsByTopic.values().stream().anyMatch(count -> count > 1)) {
             init();
@@ -829,26 +829,6 @@ public class TopologyTestDriver implements Closeable {
     }
 
     /**
-     * Create a {@link TestInputTopic} for a multi-partition topic (KIP-1238). The partition count is
-     * declared as if {@link #declareTopic(String, int)} had been called.
-     *
-     * @param topicName the name of the topic
-     * @param keySerializer the {@link Serializer} for the key type
-     * @param valueSerializer the {@link Serializer} for the value type
-     * @param partitions the number of partitions to simulate for this topic (must be at least 1)
-     * @param <K> the key type
-     * @param <V> the value type
-     * @return a {@link TestInputTopic} configured for this topic
-     */
-    public final <K, V> TestInputTopic<K, V> createInputTopic(final String topicName,
-                                                              final Serializer<K> keySerializer,
-                                                              final Serializer<V> valueSerializer,
-                                                              final int partitions) {
-        declareTopic(topicName, partitions);
-        return createInputTopic(topicName, keySerializer, valueSerializer);
-    }
-
-    /**
      * Create {@link TestInputTopic} to be used for piping records to topic
      * Uses provided start timestamp and autoAdvance parameter for records
      *
@@ -886,30 +866,10 @@ public class TopologyTestDriver implements Closeable {
     }
 
     /**
-     * Create a {@link TestOutputTopic} for a multi-partition topic (KIP-1238). The partition count is
-     * declared as if {@link #declareTopic(String, int)} had been called.
-     *
-     * @param topicName the name of the topic
-     * @param keyDeserializer the {@link Deserializer} for the key type
-     * @param valueDeserializer the {@link Deserializer} for the value type
-     * @param partitions the number of partitions to simulate for this topic (must be at least 1)
-     * @param <K> the key type
-     * @param <V> the value type
-     * @return a {@link TestOutputTopic} configured for this topic
-     */
-    public final <K, V> TestOutputTopic<K, V> createOutputTopic(final String topicName,
-                                                                final Deserializer<K> keyDeserializer,
-                                                                final Deserializer<V> valueDeserializer,
-                                                                final int partitions) {
-        declareTopic(topicName, partitions);
-        return createOutputTopic(topicName, keyDeserializer, valueDeserializer);
-    }
-
-    /**
-     * Declare the number of partitions for an input, output, or generated repartition topic (KIP-1238).
+     * Declare the number of partitions for an input, output, or generated repartition topic.
      * Must be called before any record is piped. Subsequent calls with the same count are no-ops; calls
      * with a different count throw {@link IllegalArgumentException}. Calls after the driver has been
-     * implicitly initialised (i.e. after the first pipe) throw {@link IllegalStateException}.
+     * initialised throw {@link IllegalStateException}.
      *
      * @param topicName the topic to declare
      * @param partitions the number of partitions (must be at least 1)
@@ -938,7 +898,7 @@ public class TopologyTestDriver implements Closeable {
     }
 
     /**
-     * Mark the driver as initialised (KIP-1238). Idempotent. Call this after declaring all multi-partition
+     * Mark the driver as initialised. Idempotent. Call this after declaring all multi-partition
      * topics and before piping records. The single-partition back-compat path auto-initialises on first use,
      * so existing tests do not need to call this method.
      *
@@ -946,8 +906,7 @@ public class TopologyTestDriver implements Closeable {
      * {@link ProcessorTopology}, resolves the partition count of any internal repartition topic
      * (declared explicit count &gt; co-partition group inheritance &gt; max upstream sources &gt;
      * fallback to 1), validates co-partitioning, and computes the per-sub-topology partition count
-     * as the max across its source topics. The runtime task instances themselves are still created
-     * lazily by the legacy execution path; KIP-1238 Pass 5 will switch the runtime over.</p>
+     * as the max across its source topics.</p>
      */
     public void init() {
         if (initialized) {
@@ -1251,7 +1210,7 @@ public class TopologyTestDriver implements Closeable {
     }
 
     /**
-     * Resolve the partition a record routes to (KIP-1238).
+     * Resolve the partition a record routes to.
      * Explicit partition wins; otherwise {@code Utils.toPositive(Utils.murmur2(keyBytes)) % n} matches
      * {@code BuiltInPartitioner.partitionForKey}; null key or n == 1 routes to partition 0.
      */
@@ -1270,7 +1229,7 @@ public class TopologyTestDriver implements Closeable {
             return 0;
         }
         if (keyBytes == null) {
-            // KIP-1238: distribute null-key records round-robin across the topic's partitions.
+            // Distribute null-key records round-robin across the topic's partitions.
             final int count = nullKeyRoundRobinByTopic.merge(topic, 1, Integer::sum);
             return (count - 1) % n;
         }
@@ -1278,7 +1237,7 @@ public class TopologyTestDriver implements Closeable {
     }
 
     /**
-     * Multi-sub-topology pipe path (KIP-1238). Routes the record to the task owning the resolved
+     * Multi-sub-topology pipe path. Routes the record to the task owning the resolved
      * (topic, partition) and drains every task to quiescence before returning.
      */
     private void pipeRecordMultiSub(final String topicName,
@@ -1450,10 +1409,10 @@ public class TopologyTestDriver implements Closeable {
         }
         final K key = keyDeserializer.deserialize(record.topic(), record.headers(), record.key());
         final V value = valueDeserializer.deserialize(record.topic(), record.headers(), record.value());
-        // KIP-1238: when the multi-sub-topology runtime is active, propagate the partition that
-        // the driver actually routed/stamped (see captureOutputsMultiSub). The legacy single-task
-        // path keeps partition=null on the returned TestRecord to preserve byte-identical
-        // behaviour for pre-KIP-1238 tests that compare full TestRecords by equals().
+        // When the multi-sub-topology runtime is active, propagate the partition the driver actually
+        // routed/stamped (see captureOutputsMultiSub). The legacy single-task path leaves the partition
+        // unset on the returned TestRecord so existing tests comparing full TestRecords by equals()
+        // are unaffected.
         final int outputPartition = initialized && record.partition() != null ? record.partition() : -1;
         final Long ts = record.timestamp();
         return new TestRecord<>(key, value, record.headers(),
@@ -1586,7 +1545,7 @@ public class TopologyTestDriver implements Closeable {
     }
 
     /**
-     * Multi-sub-topology lookup (KIP-1238). A global store match wins; otherwise we scan the tasks
+     * Multi-sub-topology lookup. A global store match wins; otherwise we scan the tasks
      * that own this store and return the only one. If the store is hosted by more than one task,
      * throw {@link IllegalStateException} pointing at the partition-aware overloads.
      */
@@ -1651,7 +1610,7 @@ public class TopologyTestDriver implements Closeable {
 
     /**
      * Return the {@link StateStore} for the task owning {@code partition} of the sub-topology that
-     * registers a store named {@code name} (KIP-1238). If the store name appears in multiple
+     * registers a store named {@code name}. If the store name appears in multiple
      * sub-topologies, throws {@link IllegalStateException}; use the 3-arg overload to disambiguate.
      *
      * @param name the store name
@@ -1676,7 +1635,7 @@ public class TopologyTestDriver implements Closeable {
     }
 
     /**
-     * Fully-qualified {@link StateStore} accessor (KIP-1238). Use when a store name appears in more
+     * Fully-qualified {@link StateStore} accessor. Use when a store name appears in more
      * than one sub-topology.
      *
      * @param name the store name
@@ -1703,7 +1662,7 @@ public class TopologyTestDriver implements Closeable {
 
     /**
      * @return the number of partitions of the sub-topology that registers {@code storeName}, or 0
-     *         if no sub-topology registers it (or 1 for a global store) (KIP-1238).
+     *         if no sub-topology registers it (or 1 for a global store).
      */
     public int partitionsOf(final String storeName) {
         if (!initialized) {
@@ -1717,7 +1676,7 @@ public class TopologyTestDriver implements Closeable {
     }
 
     /**
-     * @return the number of partitions of the given sub-topology, or 0 if the id is unknown (KIP-1238).
+     * @return the number of partitions of the given sub-topology, or 0 if the id is unknown.
      */
     public int partitionsOfSubtopology(final int subtopologyId) {
         if (!initialized) {
@@ -1727,7 +1686,7 @@ public class TopologyTestDriver implements Closeable {
     }
 
     /**
-     * @return an unmodifiable list of the sub-topology ids in this driver (KIP-1238).
+     * @return an unmodifiable list of the sub-topology ids in this driver.
      */
     public List<Integer> subtopologies() {
         if (!initialized) {
@@ -2056,7 +2015,7 @@ public class TopologyTestDriver implements Closeable {
     }
 
     /**
-     * Partition-aware {@link KeyValueStore} accessor (KIP-1238).
+     * Partition-aware {@link KeyValueStore} accessor.
      */
     @SuppressWarnings("unchecked")
     public <K, V> KeyValueStore<K, V> getKeyValueStore(final String name, final int partition) {
@@ -2069,7 +2028,7 @@ public class TopologyTestDriver implements Closeable {
     }
 
     /**
-     * Partition-aware {@link TimestampedKeyValueStore} accessor (KIP-1238).
+     * Partition-aware {@link TimestampedKeyValueStore} accessor.
      */
     @SuppressWarnings("unchecked")
     public <K, V> KeyValueStore<K, ValueAndTimestamp<V>> getTimestampedKeyValueStore(final String name, final int partition) {
@@ -2078,7 +2037,7 @@ public class TopologyTestDriver implements Closeable {
     }
 
     /**
-     * Partition-aware {@link VersionedKeyValueStore} accessor (KIP-1238).
+     * Partition-aware {@link VersionedKeyValueStore} accessor.
      */
     @SuppressWarnings("unchecked")
     public <K, V> VersionedKeyValueStore<K, V> getVersionedKeyValueStore(final String name, final int partition) {
@@ -2087,7 +2046,7 @@ public class TopologyTestDriver implements Closeable {
     }
 
     /**
-     * Partition-aware {@link WindowStore} accessor (KIP-1238).
+     * Partition-aware {@link WindowStore} accessor.
      */
     @SuppressWarnings("unchecked")
     public <K, V> WindowStore<K, V> getWindowStore(final String name, final int partition) {
@@ -2100,7 +2059,7 @@ public class TopologyTestDriver implements Closeable {
     }
 
     /**
-     * Partition-aware {@link TimestampedWindowStore} accessor (KIP-1238).
+     * Partition-aware {@link TimestampedWindowStore} accessor.
      */
     @SuppressWarnings("unchecked")
     public <K, V> WindowStore<K, ValueAndTimestamp<V>> getTimestampedWindowStore(final String name, final int partition) {
@@ -2109,7 +2068,7 @@ public class TopologyTestDriver implements Closeable {
     }
 
     /**
-     * Partition-aware {@link SessionStore} accessor (KIP-1238).
+     * Partition-aware {@link SessionStore} accessor.
      */
     @SuppressWarnings("unchecked")
     public <K, V> SessionStore<K, V> getSessionStore(final String name, final int partition) {
@@ -2118,7 +2077,7 @@ public class TopologyTestDriver implements Closeable {
     }
 
     /**
-     * Partition-aware {@link TimestampedKeyValueStoreWithHeaders} accessor (KIP-1238).
+     * Partition-aware {@link TimestampedKeyValueStoreWithHeaders} accessor.
      */
     @SuppressWarnings("unchecked")
     public <K, V> KeyValueStore<K, ValueTimestampHeaders<V>> getTimestampedKeyValueStoreWithHeaders(final String name, final int partition) {
@@ -2127,7 +2086,7 @@ public class TopologyTestDriver implements Closeable {
     }
 
     /**
-     * Partition-aware {@link TimestampedWindowStoreWithHeaders} accessor (KIP-1238).
+     * Partition-aware {@link TimestampedWindowStoreWithHeaders} accessor.
      */
     @SuppressWarnings("unchecked")
     public <K, V> WindowStore<K, ValueTimestampHeaders<V>> getTimestampedWindowStoreWithHeaders(final String name, final int partition) {
@@ -2136,7 +2095,7 @@ public class TopologyTestDriver implements Closeable {
     }
 
     /**
-     * Partition-aware {@link SessionStoreWithHeaders} accessor (KIP-1238).
+     * Partition-aware {@link SessionStoreWithHeaders} accessor.
      */
     @SuppressWarnings("unchecked")
     public <K, V> SessionStoreWithHeaders<K, V> getSessionStoreWithHeaders(final String name, final int partition) {

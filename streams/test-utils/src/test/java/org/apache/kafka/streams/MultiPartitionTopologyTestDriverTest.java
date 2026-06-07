@@ -53,7 +53,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Tests for the multi-partition support added by KIP-1238 to {@link TopologyTestDriver}.
+ * Tests for the multi-partition support of {@link TopologyTestDriver}.
  * Each test exercises one of the new behaviours: explicit-partition routing, key-hash routing
  * matching the production partitioner, internal repartition topic resolution, co-partition
  * validation, heterogeneous partition counts across sub-topologies and partition-aware state
@@ -124,15 +124,14 @@ public class MultiPartitionTopologyTestDriverTest {
     public void keyHashRoutingMatchesBuiltInPartitioner() {
         final int n = 4;
         try (TopologyTestDriver driver = new TopologyTestDriver(identityTopology(), baseProps())) {
-            driver.createInputTopic(IN_TOPIC, STRING_SER, STRING_SER, n);
-            driver.createOutputTopic(OUT_TOPIC, STRING_DES, STRING_DES, n);
+            driver.declareTopic(IN_TOPIC, n);
+            driver.declareTopic(OUT_TOPIC, n);
             final TestInputTopic<String, String> in =
                 driver.createInputTopic(IN_TOPIC, STRING_SER, STRING_SER);
 
             for (final String key : new String[] {"a", "b", "c", "d", "key-42", "abcdefgh"}) {
                 in.pipeInput(key, "v");
-                final org.apache.kafka.clients.producer.ProducerRecord<byte[], byte[]> got =
-                    driver.readRecord(OUT_TOPIC);
+                final ProducerRecord<byte[], byte[]> got = driver.readRecord(OUT_TOPIC);
                 assertNotNull(got, "no record produced for key=" + key);
                 final int expected = BuiltInPartitioner.partitionForKey(STRING_SER.serialize(IN_TOPIC, key), n);
                 assertEquals(Integer.valueOf(expected), got.partition(),
@@ -143,11 +142,11 @@ public class MultiPartitionTopologyTestDriverTest {
 
     @Test
     public void nullKeyRoutesRoundRobin() {
-        // KIP-1238: null-key records carry no routable key, so the driver distributes them
-        // round-robin across the topic's partitions (0, 1, 2, 0, ...) rather than pinning them all to 0.
+        // Null-key records carry no routable key, so the driver distributes them round-robin across
+        // the topic's partitions (0, 1, 2, 0, ...) rather than pinning them all to 0.
         try (TopologyTestDriver driver = new TopologyTestDriver(identityTopology(), baseProps())) {
-            driver.createInputTopic(IN_TOPIC, STRING_SER, STRING_SER, 3);
-            driver.createOutputTopic(OUT_TOPIC, STRING_DES, STRING_DES, 3);
+            driver.declareTopic(IN_TOPIC, 3);
+            driver.declareTopic(OUT_TOPIC, 3);
             final TestInputTopic<String, String> in =
                 driver.createInputTopic(IN_TOPIC, STRING_SER, STRING_SER);
             final int[] expected = {0, 1, 2, 0};
@@ -283,7 +282,7 @@ public class MultiPartitionTopologyTestDriverTest {
 
     @Test
     public void withHeadersPartitionAwareAccessorsResolvePerPartition() {
-        // KIP-1238: the *WithHeaders partition-aware accessors resolve the partition-local store and,
+        // The *WithHeaders partition-aware accessors resolve the partition-local store and,
         // like their no-arg counterparts, return null when it is not a *WithHeaders store. Exercising
         // partitions 0..2 of a partitioned plain count store proves the per-partition lookup path works.
         final StreamsBuilder builder = new StreamsBuilder();
@@ -319,7 +318,7 @@ public class MultiPartitionTopologyTestDriverTest {
 
     @Test
     public void singlePartitionDeclarationStaysOnLegacyPath() {
-        // KIP-1238: the driver only auto-switches to multi-partition mode when a declared topic has
+        // The driver only auto-switches to multi-partition mode when a declared topic has
         // more than one partition. Declaring everything as single-partition keeps the legacy path,
         // where output records carry no routed partition (partition() == -1).
         try (TopologyTestDriver driver = new TopologyTestDriver(identityTopology(), baseProps())) {
@@ -336,11 +335,11 @@ public class MultiPartitionTopologyTestDriverTest {
         }
     }
 
-    // --- KIP-1238 TopologyTestDriverBuilder (Passe B) ---
+    // --- TopologyTestDriverBuilder ---
 
     @Test
     public void builderProducesWorkingMultiPartitionDriver() {
-        // The builder is the KIP-1238 blessed entry point: build() declares topics and, when one has
+        // The builder is the blessed entry point: build() declares topics and, when one has
         // >1 partition, wires the multi-partition task graph. A key must land in the count store at the
         // partition its murmur2 hash selects (no selectKey => store co-partitioned with the source).
         final StreamsBuilder builder = new StreamsBuilder();
@@ -400,7 +399,7 @@ public class MultiPartitionTopologyTestDriverTest {
     }
 
     /**
-     * Exercises four KIP-1238 concerns at once with a single topology:
+     * Exercises four multi-partition concerns at once with a single topology:
      * <ul>
      *   <li><b>Two sources with different partition counts:</b> {@code inA} at 4 partitions
      *       feeds sub-topology A; {@code inB} at 2 partitions feeds sub-topology B.</li>
@@ -621,7 +620,7 @@ public class MultiPartitionTopologyTestDriverTest {
      *
      * <p>Production Kafka Streams does NOT raise a co-partition error here: the DSL only
      * registers co-partition groups for joins (KStream-KStream, KStream-KTable, foreign-key),
-     * not for shared-store merges. The KIP-1238 {@link TopologyTestDriver} inherits the same
+     * not for shared-store merges. The {@link TopologyTestDriver} inherits the same
      * blind spot, so {@code validateCopartitioning()} finds nothing to check and
      * {@code init()} succeeds. The merged sub-topology then runs at
      * {@code max(2, 3) = 3} partitions, and the same key arriving on both sources lands in
@@ -791,7 +790,7 @@ public class MultiPartitionTopologyTestDriverTest {
     @Test
     public void globalKTableJoinFedFromGlobalTaskIsVisibleToEveryActiveTask() {
         final String factsTopic = "facts";   // 4 partitions → 4 active StreamTasks
-        final String dimTopic = "dim";        // global, single partition by KIP-1238 contract
+        final String dimTopic = "dim";        // global, single partition by contract
         final String outTopic = "out";        // 4 partitions, mirrors facts to keep routing simple
 
         final StreamsBuilder builder = new StreamsBuilder();
@@ -822,7 +821,7 @@ public class MultiPartitionTopologyTestDriverTest {
             // Cross-check: the global store reports 1 partition and is reachable via the
             // no-arg accessor (there is no ambiguity for globals in the multi-sub path).
             assertEquals(1, driver.partitionsOf("dimStore"),
-                "global stores must report a single partition (KIP-1238 contract)");
+                "global stores must report a single partition");
             final KeyValueStore<String, String> globalStore = driver.getKeyValueStore("dimStore");
             assertNotNull(globalStore, "global dimStore should be reachable without partition arg");
             for (final String k : keys) {

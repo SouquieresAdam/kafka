@@ -154,7 +154,7 @@ public class TestRecordTest {
 
     @Test
     public void testPartitionDefaultsToUnset() {
-        // KIP-1238: records built without an explicit partition default to the -1 sentinel,
+        // Records built without an explicit partition default to the -1 sentinel,
         // meaning "let the driver route by key hash".
         assertEquals(-1, new TestRecord<>(key, value, headers, recordTime).partition());
         assertEquals(-1, new TestRecord<>(key, value, headers, recordMs).partition());
@@ -165,14 +165,14 @@ public class TestRecordTest {
 
     @Test
     public void testExplicitPartitionConstructor() {
-        // KIP-1238: the (key, value, headers, recordTime, partition) constructor pins the partition.
+        // The (key, value, headers, recordTime, partition) constructor pins the partition.
         final TestRecord<String, Integer> testRecord = new TestRecord<>(key, value, headers, recordTime, 3);
         assertEquals(3, testRecord.partition());
     }
 
     @Test
     public void testEqualsConsidersPartition() {
-        // KIP-1238: equals()/hashCode() take the partition into account.
+        // equals()/hashCode() take the partition into account.
         final TestRecord<String, Integer> p0 = new TestRecord<>(key, value, headers, recordTime, 0);
         final TestRecord<String, Integer> p1 = new TestRecord<>(key, value, headers, recordTime, 1);
         assertNotEquals(p0, p1);
@@ -187,7 +187,7 @@ public class TestRecordTest {
 
     @Test
     public void testEqualsIgnorePartition() {
-        // KIP-1238: equalsIgnorePartition() matches on every field except the partition.
+        // equalsIgnorePartition() matches on every field except the partition.
         final TestRecord<String, Integer> p0 = new TestRecord<>(key, value, headers, recordTime, 0);
         final TestRecord<String, Integer> p1 = new TestRecord<>(key, value, headers, recordTime, 1);
         assertNotEquals(p0, p1);

@@ -34,7 +34,7 @@ import java.util.StringJoiner;
  */
 public class TestRecord<K, V> {
     /**
-     * Sentinel returned by {@link #partition()} when no explicit partition was set on the record (KIP-1238).
+     * Sentinel returned by {@link #partition()} when no explicit partition was set on the record.
      * A record carrying this value is routed by the driver using the record key's hash.
      */
     private static final int NO_PARTITION = -1;
@@ -58,7 +58,7 @@ public class TestRecord<K, V> {
     }
 
     /**
-     * Creates a record with an explicit target partition (KIP-1238).
+     * Creates a record with an explicit target partition.
      *
      * @param key The key that will be included in the record
      * @param value The value of the record
@@ -232,7 +232,7 @@ public class TestRecord<K, V> {
     }
 
     /**
-     * @return The explicit target partition, or {@code -1} if the record should be routed by key hash (KIP-1238).
+     * @return The explicit target partition, or {@code -1} if the record should be routed by key hash.
      */
     public int partition() {
         return partition;
@@ -268,7 +268,7 @@ public class TestRecord<K, V> {
     }
 
     /**
-     * Compares this record to another for equality on every field <em>except</em> the partition (KIP-1238).
+     * Compares this record to another for equality on every field <em>except</em> the partition.
      * Useful when asserting on driver output where the routed partition is irrelevant to the test.
      *
      * @param o the object to compare with
