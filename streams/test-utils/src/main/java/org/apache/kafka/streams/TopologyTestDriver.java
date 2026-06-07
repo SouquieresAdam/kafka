@@ -1664,7 +1664,7 @@ public class TopologyTestDriver implements Closeable {
      * @return the number of partitions of the sub-topology that registers {@code storeName}, or 0
      *         if no sub-topology registers it (or 1 for a global store).
      */
-    public int partitionsOf(final String storeName) {
+    int partitionsOf(final String storeName) {
         if (!initialized) {
             init();
         }
@@ -1678,7 +1678,7 @@ public class TopologyTestDriver implements Closeable {
     /**
      * @return the number of partitions of the given sub-topology, or 0 if the id is unknown.
      */
-    public int partitionsOfSubtopology(final int subtopologyId) {
+    int partitionsOfSubtopology(final int subtopologyId) {
         if (!initialized) {
             init();
         }
@@ -1688,7 +1688,7 @@ public class TopologyTestDriver implements Closeable {
     /**
      * @return an unmodifiable list of the sub-topology ids in this driver.
      */
-    public List<Integer> subtopologies() {
+    List<Integer> subtopologies() {
         if (!initialized) {
             init();
         }
