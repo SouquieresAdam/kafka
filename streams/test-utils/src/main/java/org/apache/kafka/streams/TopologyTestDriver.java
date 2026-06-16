@@ -109,6 +109,7 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -253,6 +254,16 @@ public class TopologyTestDriver implements Closeable {
     private final Map<String, Queue<ProducerRecord<byte[], byte[]>>> outputRecordsByTopic = new HashMap<>();
     private final StreamsConfigUtils.ProcessingMode processingMode;
 
+    // Multi-partition lifecycle (declareTopic/init). The fields below back the new API only;
+    // the legacy single-partition execution path does not consult them and continues to work unchanged.
+    private final Map<String, Integer> declaredPartitionsByTopic = new HashMap<>();
+    private boolean initialized = false;
+    private MultiPartitionRuntime runtime;
+    private StreamsConfig multiSubStreamsConfig;
+    private TaskConfig multiSubTaskConfig;
+    private StreamsMetricsImpl multiSubStreamsMetrics;
+    private ThreadCache multiSubCache;
+
     private final StateRestoreListener stateRestoreListener = new StateRestoreListener() {
         @Override
         public void onRestoreStart(final TopicPartition topicPartition, final String storeName, final long startingOffset, final long endingOffset) {}
@@ -314,15 +325,16 @@ public class TopologyTestDriver implements Closeable {
     }
 
     /**
-     * Create a new test diver instance.
+     * Create a new test diver instance. Package-private core constructor shared by the (deprecated)
+     * public constructors and by {@link TopologyTestDriverBuilder}, which is the blessed entry point.
      *
      * @param builder builder for the topology to be tested
      * @param config the configuration for the topology
      * @param initialWallClockTimeMs the initial value of internally mocked wall-clock time
      */
-    private TopologyTestDriver(final InternalTopologyBuilder builder,
-                               final Properties config,
-                               final long initialWallClockTimeMs) {
+    TopologyTestDriver(final InternalTopologyBuilder builder,
+                       final Properties config,
+                       final long initialWallClockTimeMs) {
         final Properties configCopy = new Properties();
         configCopy.putAll(config);
         configCopy.putIfAbsent(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, "dummy-bootstrap-host:0");
@@ -353,7 +365,17 @@ public class TopologyTestDriver implements Closeable {
         producer = new MockProducer<>(Cluster.empty(), true, null, bytesSerializer, bytesSerializer) {
             @Override
             public List<PartitionInfo> partitionsFor(final String topic) {
-                return Collections.singletonList(new PartitionInfo(topic, PARTITION_ID, null, null, null));
+                // When topics are declared with > 1 partition, the sink-side partitioner
+                // (DefaultStreamPartitioner) must see them all to compute the right output partition.
+                final int n = Math.max(1, declaredPartitionsByTopic.getOrDefault(topic, 1));
+                if (n == 1) {
+                    return Collections.singletonList(new PartitionInfo(topic, PARTITION_ID, null, null, null));
+                }
+                final List<PartitionInfo> infos = new ArrayList<>(n);
+                for (int p = 0; p < n; p++) {
+                    infos.add(new PartitionInfo(topic, p, null, null, null));
+                }
+                return infos;
             }
         };
 
@@ -366,6 +388,12 @@ public class TopologyTestDriver implements Closeable {
 
         setupGlobalTask(mockWallClockTime, streamsConfig, streamsMetrics, cache);
         setupTask(streamsConfig, streamsMetrics, cache, internalTopologyBuilder.topologyConfigs().getTaskConfig());
+
+        // Capture references the multi-sub-topology runtime path needs at init() time.
+        this.multiSubStreamsConfig = streamsConfig;
+        this.multiSubTaskConfig = internalTopologyBuilder.topologyConfigs().getTaskConfig();
+        this.multiSubStreamsMetrics = streamsMetrics;
+        this.multiSubCache = cache;
     }
 
     private static void logIfTaskIdleEnabled(final StreamsConfig streamsConfig) {
@@ -547,6 +575,26 @@ public class TopologyTestDriver implements Closeable {
                             final byte[] key,
                             final byte[] value,
                             final Headers headers) {
+        pipeRecord(topicName, timestamp, key, value, headers, -1);
+    }
+
+    private void pipeRecord(final String topicName,
+                            final long timestamp,
+                            final byte[] key,
+                            final byte[] value,
+                            final Headers headers,
+                            final int explicitPartition) {
+        // Lazy auto-init: switch to the multi-sub-topology execution path on the first record only when
+        // at least one declared topic has more than one partition. Declaring topics with a
+        // single partition keeps the legacy single-flat-task path, preserving strict back-compat.
+        if (!initialized && declaredPartitionsByTopic.values().stream().anyMatch(count -> count > 1)) {
+            init();
+        }
+        if (initialized) {
+            runtime.pipeRecord(topicName, timestamp, key, value, headers, explicitPartition);
+            return;
+        }
+
         final TopicPartition inputTopicOrPatternPartition = getInputTopicOrPatternPartition(topicName);
         final TopicPartition globalInputTopicPartition = globalPartitionsByInputTopic.get(topicName);
 
@@ -720,6 +768,10 @@ public class TopologyTestDriver implements Closeable {
     public void advanceWallClockTime(final Duration advance) {
         Objects.requireNonNull(advance, "advance cannot be null");
         mockWallClockTime.sleep(advance.toMillis());
+        if (initialized) {
+            runtime.advanceWallClockTime();
+            return;
+        }
         if (task != null) {
             task.maybePunctuateSystemTime();
             commit(task.prepareCommit(true));
@@ -801,6 +853,107 @@ public class TopologyTestDriver implements Closeable {
     }
 
     /**
+     * Declare the number of partitions for an input, output, or generated repartition topic.
+     * Must be called before any record is piped. Subsequent calls with the same count are no-ops; calls
+     * with a different count throw {@link IllegalArgumentException}. Calls after the driver has been
+     * initialised throw {@link IllegalStateException}.
+     *
+     * @param topicName the topic to declare
+     * @param partitions the number of partitions (must be at least 1)
+     * @throws IllegalStateException if the driver has already been initialised
+     * @throws IllegalArgumentException if {@code partitions} is less than 1, or the topic was already
+     *         declared with a different count
+     */
+    void declareTopic(final String topicName, final int partitions) {
+        Objects.requireNonNull(topicName, "topicName cannot be null");
+        if (initialized) {
+            throw new IllegalStateException(
+                "Cannot declare topic '" + topicName + "' after the driver has been initialised; "
+                    + "declare all multi-partition topics before piping records.");
+        }
+        if (partitions < 1) {
+            throw new IllegalArgumentException(
+                "Partition count must be at least 1 (topic='" + topicName + "', partitions=" + partitions + ").");
+        }
+        final Integer existing = declaredPartitionsByTopic.get(topicName);
+        if (existing != null && existing != partitions) {
+            throw new IllegalArgumentException(
+                "Topic '" + topicName + "' was already declared with " + existing
+                    + " partitions; cannot redeclare with " + partitions + ".");
+        }
+        declaredPartitionsByTopic.put(topicName, partitions);
+    }
+
+    /**
+     * Mark the driver as initialised. Idempotent. Call this after declaring all multi-partition
+     * topics and before piping records. The single-partition back-compat path auto-initialises on first use,
+     * so existing tests do not need to call this method.
+     *
+     * <p>This builds the sub-topology task graph: for each sub-topology, it constructs its
+     * {@link ProcessorTopology}, resolves the partition count of any internal repartition topic
+     * (declared explicit count &gt; co-partition group inheritance &gt; max upstream sources &gt;
+     * fallback to 1), validates co-partitioning, and computes the per-sub-topology partition count
+     * as the max across its source topics.</p>
+     */
+    void init() {
+        if (initialized) {
+            return;
+        }
+
+        // Plan the multi-partition layout (task sub-topologies, per-topic and per-sub-topology
+        // partition counts, co-partition validation).
+        final MultiPartitionTopologyPlan plan =
+            new MultiPartitionTopologyPlan(internalTopologyBuilder, globalTopology, declaredPartitionsByTopic);
+        plan.compute();
+
+        // Mirror the resolved partition counts so the shared MockProducer sees the right topic layout.
+        declaredPartitionsByTopic.putAll(plan.resolvedTopicPartitions());
+
+        runtime = new MultiPartitionRuntime(
+            plan,
+            internalTopologyBuilder,
+            consumer,
+            producer,
+            testDriverProducer,
+            globalStateManager,
+            multiSubStreamsConfig,
+            multiSubTaskConfig,
+            multiSubStreamsMetrics,
+            multiSubCache,
+            stateDirectory,
+            logContext,
+            mockWallClockTime,
+            new MultiPartitionRuntime.Host() {
+                @Override
+                public void commit(final Map<TopicPartition, OffsetAndMetadata> offsets) {
+                    TopologyTestDriver.this.commit(offsets);
+                }
+
+                @Override
+                public void processGlobalRecord(final TopicPartition partition,
+                                                final long timestamp,
+                                                final byte[] key,
+                                                final byte[] value,
+                                                final Headers headers) {
+                    TopologyTestDriver.this.processGlobalRecord(partition, timestamp, key, value, headers);
+                }
+
+                @Override
+                public TopicPartition globalPartitionOrNull(final String topic) {
+                    return globalPartitionsByInputTopic.get(topic);
+                }
+
+                @Override
+                public void recordOutput(final String topic, final ProducerRecord<byte[], byte[]> record) {
+                    outputRecordsByTopic.computeIfAbsent(topic, k -> new LinkedList<>()).add(record);
+                }
+            });
+        runtime.build();
+
+        initialized = true;
+    }
+
+    /**
      * Get all the names of all the topics to which records have been produced during the test run.
      * <p>
      * Call this method after piping the input into the test driver to retrieve the full set of topic names the topology
@@ -836,7 +989,14 @@ public class TopologyTestDriver implements Closeable {
         }
         final K key = keyDeserializer.deserialize(record.topic(), record.headers(), record.key());
         final V value = valueDeserializer.deserialize(record.topic(), record.headers(), record.value());
-        return new TestRecord<>(key, value, record.headers(), record.timestamp());
+        // When the multi-sub-topology runtime is active, propagate the partition the driver actually
+        // routed/stamped (see MultiPartitionRuntime#captureOutputs). The legacy single-task path leaves
+        // the partition unset on the returned TestRecord so existing tests comparing full TestRecords by
+        // equals() are unaffected.
+        final int outputPartition = initialized && record.partition() != null ? record.partition() : -1;
+        final Long ts = record.timestamp();
+        return new TestRecord<>(key, value, record.headers(),
+            ts == null ? null : Instant.ofEpochMilli(ts), outputPartition);
     }
 
     <K, V> void pipeRecord(final String topic,
@@ -855,7 +1015,7 @@ public class TopologyTestDriver implements Closeable {
             throw new IllegalStateException("Provided `TestRecord` does not have a timestamp and no timestamp overwrite was provided via `time` parameter.");
         }
 
-        pipeRecord(topic, timestamp, serializedKey, serializedValue, record.headers());
+        pipeRecord(topic, timestamp, serializedKey, serializedValue, record.headers(), record.partition());
     }
 
     final long queueSize(final String topic) {
@@ -936,6 +1096,9 @@ public class TopologyTestDriver implements Closeable {
 
     private StateStore getStateStore(final String name,
                                      final boolean throwForBuiltInStores) {
+        if (initialized) {
+            return runtime.getStateStore(name, throwForBuiltInStores);
+        }
         if (task != null) {
             task.processorContext().setRecordContext(new ProcessorRecordContext(0L, -1L, -1, null, new RecordHeaders()));
             final StateStore stateStore = ((ProcessorContextImpl) task.processorContext()).stateManager().store(name);
@@ -961,7 +1124,72 @@ public class TopologyTestDriver implements Closeable {
         return null;
     }
 
-    private void throwIfBuiltInStore(final StateStore stateStore) {
+    /**
+     * Return the {@link StateStore} for the task owning {@code partition} of the sub-topology that
+     * registers a store named {@code name}. If the store name appears in multiple
+     * sub-topologies, throws {@link IllegalStateException}.
+     *
+     * @param name the store name
+     * @param partition the partition whose owning task should be queried
+     * @return the {@link StateStore}, or {@code null} if no sub-topology registers a store with this name
+     */
+    public StateStore getStateStore(final String name, final int partition) {
+        if (!initialized) {
+            init();
+        }
+        return runtime.getStateStore(name, partition);
+    }
+
+    /**
+     * Internal fully-qualified {@link StateStore} accessor: resolves a store to the task owning
+     * {@code (subtopologyId, partition)}. Package-private -- not part of the KIP-1238 public API;
+     * callers use {@link #getStateStore(String, int)}, which resolves the sub-topology by store name.
+     *
+     * @param name the store name
+     * @param subtopologyId the sub-topology id
+     * @param partition the partition whose owning task should be queried
+     * @return the {@link StateStore}, or {@code null} if the task does not register a store with this name
+     * @throws IllegalArgumentException if no task exists for {@code (subtopologyId, partition)}
+     */
+    StateStore getStateStore(final String name, final int subtopologyId, final int partition) {
+        if (!initialized) {
+            init();
+        }
+        return runtime.getStateStore(name, subtopologyId, partition);
+    }
+
+    /**
+     * @return the number of partitions of the sub-topology that registers {@code storeName}, or 0
+     *         if no sub-topology registers it (or 1 for a global store).
+     */
+    int partitionsOf(final String storeName) {
+        if (!initialized) {
+            init();
+        }
+        return runtime.partitionsOf(storeName);
+    }
+
+    /**
+     * @return the number of partitions of the given sub-topology, or 0 if the id is unknown.
+     */
+    int partitionsOfSubtopology(final int subtopologyId) {
+        if (!initialized) {
+            init();
+        }
+        return runtime.partitionsOfSubtopology(subtopologyId);
+    }
+
+    /**
+     * @return an unmodifiable list of the sub-topology ids in this driver.
+     */
+    List<Integer> subtopologies() {
+        if (!initialized) {
+            init();
+        }
+        return runtime.subtopologies();
+    }
+
+    static void throwIfBuiltInStore(final StateStore stateStore) {
         if (stateStore instanceof VersionedKeyValueStore) {
             throw new IllegalArgumentException("Store " + stateStore.name()
                                                    + " is a versioned key-value store and should be accessed via `getVersionedKeyValueStore()`");
@@ -1281,6 +1509,95 @@ public class TopologyTestDriver implements Closeable {
     }
 
     /**
+     * Partition-aware {@link KeyValueStore} accessor.
+     */
+    @SuppressWarnings("unchecked")
+    public <K, V> KeyValueStore<K, V> getKeyValueStore(final String name, final int partition) {
+        final StateStore store = getStateStore(name, partition);
+        if (store instanceof TimestampedKeyValueStore) {
+            log.info("Method #getTimestampedKeyValueStore() should be used to access a TimestampedKeyValueStore.");
+            return new KeyValueStoreFacade<>((TimestampedKeyValueStore<K, V>) store);
+        }
+        return store instanceof KeyValueStore ? (KeyValueStore<K, V>) store : null;
+    }
+
+    /**
+     * Partition-aware {@link TimestampedKeyValueStore} accessor.
+     */
+    @SuppressWarnings("unchecked")
+    public <K, V> KeyValueStore<K, ValueAndTimestamp<V>> getTimestampedKeyValueStore(final String name, final int partition) {
+        final StateStore store = getStateStore(name, partition);
+        return store instanceof TimestampedKeyValueStore ? (TimestampedKeyValueStore<K, V>) store : null;
+    }
+
+    /**
+     * Partition-aware {@link VersionedKeyValueStore} accessor.
+     */
+    @SuppressWarnings("unchecked")
+    public <K, V> VersionedKeyValueStore<K, V> getVersionedKeyValueStore(final String name, final int partition) {
+        final StateStore store = getStateStore(name, partition);
+        return store instanceof VersionedKeyValueStore ? (VersionedKeyValueStore<K, V>) store : null;
+    }
+
+    /**
+     * Partition-aware {@link WindowStore} accessor.
+     */
+    @SuppressWarnings("unchecked")
+    public <K, V> WindowStore<K, V> getWindowStore(final String name, final int partition) {
+        final StateStore store = getStateStore(name, partition);
+        if (store instanceof TimestampedWindowStore) {
+            log.info("Method #getTimestampedWindowStore() should be used to access a TimestampedWindowStore.");
+            return new WindowStoreFacade<>((TimestampedWindowStore<K, V>) store);
+        }
+        return store instanceof WindowStore ? (WindowStore<K, V>) store : null;
+    }
+
+    /**
+     * Partition-aware {@link TimestampedWindowStore} accessor.
+     */
+    @SuppressWarnings("unchecked")
+    public <K, V> WindowStore<K, ValueAndTimestamp<V>> getTimestampedWindowStore(final String name, final int partition) {
+        final StateStore store = getStateStore(name, partition);
+        return store instanceof TimestampedWindowStore ? (TimestampedWindowStore<K, V>) store : null;
+    }
+
+    /**
+     * Partition-aware {@link SessionStore} accessor.
+     */
+    @SuppressWarnings("unchecked")
+    public <K, V> SessionStore<K, V> getSessionStore(final String name, final int partition) {
+        final StateStore store = getStateStore(name, partition);
+        return store instanceof SessionStore ? (SessionStore<K, V>) store : null;
+    }
+
+    /**
+     * Partition-aware {@link TimestampedKeyValueStoreWithHeaders} accessor.
+     */
+    @SuppressWarnings("unchecked")
+    public <K, V> KeyValueStore<K, ValueTimestampHeaders<V>> getTimestampedKeyValueStoreWithHeaders(final String name, final int partition) {
+        final StateStore store = getStateStore(name, partition);
+        return store instanceof TimestampedKeyValueStoreWithHeaders ? (TimestampedKeyValueStoreWithHeaders<K, V>) store : null;
+    }
+
+    /**
+     * Partition-aware {@link TimestampedWindowStoreWithHeaders} accessor.
+     */
+    @SuppressWarnings("unchecked")
+    public <K, V> WindowStore<K, ValueTimestampHeaders<V>> getTimestampedWindowStoreWithHeaders(final String name, final int partition) {
+        final StateStore store = getStateStore(name, partition);
+        return store instanceof TimestampedWindowStoreWithHeaders ? (TimestampedWindowStoreWithHeaders<K, V>) store : null;
+    }
+
+    /**
+     * Partition-aware {@link SessionStoreWithHeaders} accessor.
+     */
+    @SuppressWarnings("unchecked")
+    public <K, V> SessionStoreWithHeaders<K, V> getSessionStoreWithHeaders(final String name, final int partition) {
+        final StateStore store = getStateStore(name, partition);
+        return store instanceof SessionStoreWithHeaders ? (SessionStoreWithHeaders<K, V>) store : null;
+    }
+
+    /**
      * Close the driver, its topology, and all processors.
      */
     public void close() {
@@ -1290,6 +1607,9 @@ public class TopologyTestDriver implements Closeable {
             task.postCommit(true);
             task.closeClean();
         }
+        if (initialized) {
+            runtime.closeTasks();
+        }
         if (globalStateTask != null) {
             try {
                 globalStateTask.close(false);
@@ -1297,7 +1617,11 @@ public class TopologyTestDriver implements Closeable {
                 // ignore
             }
         }
-        completeAllProcessableWork();
+        if (initialized) {
+            runtime.completeAllProcessableWork();
+        } else {
+            completeAllProcessableWork();
+        }
         if (task != null && task.hasRecordsQueued()) {
             log.warn("Found some records that cannot be processed due to the" +
                          " {} configuration during TopologyTestDriver#close().",
