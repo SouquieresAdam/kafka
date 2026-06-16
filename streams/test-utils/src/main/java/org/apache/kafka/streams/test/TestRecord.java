@@ -33,10 +33,17 @@ import java.util.StringJoiner;
  * {@link TestInputTopic} will auto advance it's time when the record is piped.
  */
 public class TestRecord<K, V> {
+    /**
+     * Sentinel returned by {@link #partition()} when no explicit partition was set on the record.
+     * A record carrying this value is routed by the driver using the record key's hash.
+     */
+    private static final int NO_PARTITION = -1;
+
     private final Headers headers;
     private final K key;
     private final V value;
     private final Instant recordTime;
+    private final int partition;
 
     /**
      * Creates a record.
@@ -47,15 +54,29 @@ public class TestRecord<K, V> {
      * @param recordTime The timestamp of the record.
      */
     public TestRecord(final K key, final V value, final Headers headers, final Instant recordTime) {
+        this(key, value, headers, recordTime, NO_PARTITION);
+    }
+
+    /**
+     * Creates a record with an explicit target partition.
+     *
+     * @param key The key that will be included in the record
+     * @param value The value of the record
+     * @param headers the record headers that will be included in the record
+     * @param recordTime The timestamp of the record.
+     * @param partition The target partition for this record, or a negative value to let the driver route by key hash.
+     */
+    public TestRecord(final K key, final V value, final Headers headers, final Instant recordTime, final int partition) {
         this.key = key;
         this.value = value;
         this.recordTime = recordTime;
         this.headers = new RecordHeaders(headers);
+        this.partition = partition;
     }
 
     /**
      * Creates a record.
-     * 
+     *
      * @param key The key that will be included in the record
      * @param value The value of the record
      * @param headers the record headers that will be included in the record
@@ -74,6 +95,7 @@ public class TestRecord<K, V> {
         this.key = key;
         this.value = value;
         this.headers = new RecordHeaders(headers);
+        this.partition = NO_PARTITION;
     }
 
     /**
@@ -99,8 +121,9 @@ public class TestRecord<K, V> {
         this.value = value;
         this.headers = new RecordHeaders(headers);
         this.recordTime = null;
+        this.partition = NO_PARTITION;
     }
-    
+
     /**
      * Creates a record.
      *
@@ -112,6 +135,7 @@ public class TestRecord<K, V> {
         this.value = value;
         this.headers = new RecordHeaders();
         this.recordTime = null;
+        this.partition = NO_PARTITION;
     }
 
     /**
@@ -134,6 +158,7 @@ public class TestRecord<K, V> {
         this.value = record.value();
         this.headers = record.headers();
         this.recordTime = Instant.ofEpochMilli(record.timestamp());
+        this.partition = NO_PARTITION;
     }
 
     /**
@@ -147,6 +172,7 @@ public class TestRecord<K, V> {
         this.value = record.value();
         this.headers = record.headers();
         this.recordTime = Instant.ofEpochMilli(record.timestamp());
+        this.partition = NO_PARTITION;
     }
 
     /**
@@ -205,14 +231,24 @@ public class TestRecord<K, V> {
         return recordTime;
     }
 
+    /**
+     * @return The explicit target partition, or {@code -1} if the record should be routed by key hash.
+     */
+    public int partition() {
+        return partition;
+    }
+
     @Override
     public String toString() {
-        return new StringJoiner(", ", TestRecord.class.getSimpleName() + "[", "]")
+        final StringJoiner joiner = new StringJoiner(", ", TestRecord.class.getSimpleName() + "[", "]")
                 .add("key=" + key)
                 .add("value=" + value)
                 .add("headers=" + headers)
-                .add("recordTime=" + recordTime)
-                .toString();
+                .add("recordTime=" + recordTime);
+        if (partition != NO_PARTITION) {
+            joiner.add("partition=" + partition);
+        }
+        return joiner.toString();
     }
 
     @Override
@@ -224,6 +260,21 @@ public class TestRecord<K, V> {
             return false;
         }
         final TestRecord<?, ?> that = (TestRecord<?, ?>) o;
+        return partition == that.partition && fieldsEqualIgnoringPartition(that);
+    }
+
+    /**
+     * Compares this record to another for equality on every field <em>except</em> the partition.
+     * Useful when asserting on driver output where the routed partition is irrelevant to the test.
+     *
+     * @param that the record to compare with
+     * @return {@code true} if {@code that} is equal to this record ignoring the partition
+     */
+    public boolean equalsIgnorePartition(final TestRecord<K, V> that) {
+        return that != null && fieldsEqualIgnoringPartition(that);
+    }
+
+    private boolean fieldsEqualIgnoringPartition(final TestRecord<?, ?> that) {
         return Objects.equals(headers, that.headers) &&
             Objects.equals(key, that.key) &&
             Objects.equals(value, that.value) &&
@@ -232,6 +283,6 @@ public class TestRecord<K, V> {
 
     @Override
     public int hashCode() {
-        return Objects.hash(headers, key, value, recordTime);
+        return Objects.hash(headers, key, value, recordTime, partition);
     }
 }
