@@ -280,7 +280,9 @@ public class TopologyTestDriver implements Closeable {
      * Default test properties are used to initialize the driver instance
      *
      * @param topology the topology to be tested
+     * @deprecated Use {@link TopologyTestDriverBuilder} instead.
      */
+    @Deprecated(since = "4.4")
     public TopologyTestDriver(final Topology topology) {
         this(topology, new Properties());
     }
@@ -291,7 +293,9 @@ public class TopologyTestDriver implements Closeable {
      *
      * @param topology the topology to be tested
      * @param config   the configuration for the topology
+     * @deprecated Use {@link TopologyTestDriverBuilder} instead.
      */
+    @Deprecated(since = "4.4")
     public TopologyTestDriver(final Topology topology,
                               final Properties config) {
         this(topology, config, null);
@@ -302,7 +306,9 @@ public class TopologyTestDriver implements Closeable {
      *
      * @param topology the topology to be tested
      * @param initialWallClockTimeMs the initial value of internally mocked wall-clock time
+     * @deprecated Use {@link TopologyTestDriverBuilder} instead.
      */
+    @Deprecated(since = "4.4")
     public TopologyTestDriver(final Topology topology,
                               final Instant initialWallClockTimeMs) {
         this(topology, new Properties(), initialWallClockTimeMs);
@@ -314,7 +320,9 @@ public class TopologyTestDriver implements Closeable {
      * @param topology               the topology to be tested
      * @param config                 the configuration for the topology
      * @param initialWallClockTime   the initial value of internally mocked wall-clock time
+     * @deprecated Use {@link TopologyTestDriverBuilder} instead.
      */
+    @Deprecated(since = "4.4")
     public TopologyTestDriver(final Topology topology,
                               final Properties config,
                               final Instant initialWallClockTime) {
